@@ -59,6 +59,7 @@ class particlefilter:
         diffs = polepos_w_all[:, :2, :] - desc_sub.T[None, :, :]         # broadcast → (count, 2, M)
         dists = np.linalg.norm(diffs, axis=1)                            # (count, M)
         dists = np.minimum(dists, self.d_max)  
+        # print('dist: \n', dists[0])
 
         weights_factor = np.prod(self.poledist.pdf(dists) + 0.2, axis=1) # shape (count,)
 

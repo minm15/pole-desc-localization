@@ -259,6 +259,7 @@ def localize(sessionname, visualize=False, use_desc=False):
     polepos_m = []
     polepos_w = []
     desclocal = []
+    meas_events = []
     for i in range(len(locdata)):
         n = locdata[i]['poleparams'].shape[0]
         pad = np.hstack([np.zeros([n, 1]), np.ones([n, 1])])
@@ -271,9 +272,9 @@ def localize(sessionname, visualize=False, use_desc=False):
         session.get_T_w_r_gt(session.t_relodo[istart]).dot(T_r_mc)).dot(T_mc_r)
     
     # construct the descmap index
-    descmap_index, edges = build_descmap_index(descmap, 32)
+    descmap_index, edges = build_descmap_index(descmap, 16)
     
-    filter = particlefilter.particlefilter(500, 
+    filter = particlefilter.particlefilter(2000, 
         T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, descmap, descxy, descmap_index, edges, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
@@ -337,6 +338,11 @@ def localize(sessionname, visualize=False, use_desc=False):
                         if visualize:
                             polepos_w_est = T_w_r_est[i].dot(polepos_r_now)
                             locpoles.set_offsets(polepos_w_est[:2].T)
+                            
+                        meas_events.append({
+                            't_now': float(t_now), 
+                            'n_active': int(len(iactive))
+                        })
 
                     imap += 1
             
@@ -351,7 +357,7 @@ def localize(sessionname, visualize=False, use_desc=False):
             bar.update(i)
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))
-    np.savez(filename, T_w_r_est=T_w_r_est)
+    np.savez(filename, T_w_r_est=T_w_r_est, meas_events=np.array(meas_events, dtype=object),)
 
 def plot_trajectories():
     trajectorydir = os.path.join(
@@ -395,7 +401,10 @@ def evaluate():
             in os.listdir(os.path.join(pynclt.resultdir, sessionname)) \
                 if file.startswith(get_locfileprefix())]
         files.sort()
+
         session = pynclt.session(sessionname)
+
+        # 1) 建 t_eval（距離→時間）與對應的 GT pose（與你原本一致）
         cumdist = np.hstack([0.0, np.cumsum(np.linalg.norm(np.diff(
             session.T_w_r_gt[:, :3, 3], axis=0), axis=1))])
         t_eval = scipy.interpolate.interp1d(
@@ -403,10 +412,12 @@ def evaluate():
         T_w_r_gt = np.stack([util.project_xy(
                 session.get_T_w_r_gt(t).dot(T_r_mc)).dot(T_mc_r) \
                     for t in t_eval])
+
+        # 2) 內插各次估測到 t_eval 時間上
         T_gt_est = []
         for file in files:
-            T_w_r_est = np.load(os.path.join(
-                pynclt.resultdir, sessionname, file))['T_w_r_est']
+            fpath = os.path.join(pynclt.resultdir, sessionname, file)
+            T_w_r_est = np.load(fpath)['T_w_r_est']  # [N_relodo, 4, 4]
             T_w_r_est_interp = np.empty([len(t_eval), 4, 4])
             iodo = 1
             inum = 0
@@ -416,42 +427,109 @@ def evaluate():
                     if iodo >= session.t_relodo.shape[0]:
                         break
                 if iodo >= session.t_relodo.shape[0]:
-                        break
+                    break
                 T_w_r_est_interp[ieval] = util.interpolate_ht(
-                    T_w_r_est[iodo-1:iodo+1], 
+                    T_w_r_est[iodo-1:iodo+1],
                     session.t_relodo[iodo-1:iodo+1], t_eval[ieval])
                 inum += 1
+            # 對齊上限 inum，避免尾端無效
             T_gt_est.append(
-                np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_interp)[:inum,...])
-        T_gt_est = np.stack(T_gt_est)
+                np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_interp)[:inum, ...]
+            )
+
+        # 若有多個檔，堆成 [n_runs, L, 4, 4]
+        T_gt_est = np.stack(T_gt_est)  # L 會是 inum
+        L = T_gt_est.shape[1]
+        t_plot = t_eval[:L]  # 用來畫圖的時間軸
+
+        # 3) 各 run 的逐時位置誤差 & 平均折線（會拿來畫藍色線）
+        poserrors = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)  # [n_runs, L]
+        poserror_mean = np.mean(poserrors, axis=0)                 # [L]
+
+        # === 這裡開始：加入兩張圖（上下排列、共用 x 軸） ===
+        fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 6))
+        fig.suptitle(f'Positional Error and Measurement Timestamps — {sessionname}')
+
+        # 上圖：poserror 折線（藍色）
+        ax1.plot(t_plot, poserror_mean, color='blue', label='poserror (mean over runs)')
+        ax1.set_ylabel('poserror (m)')
+        ax1.grid(True, linestyle='--', alpha=0.4)
+        ax1.legend(loc='upper right')
+
+        # 下圖：meas_events 的紅點（沿 x 軸）
+        meas_times_all = []
+        n_active_all = []
+        for file in files:
+            fpath = os.path.join(pynclt.resultdir, sessionname, file)
+            data = np.load(fpath, allow_pickle=True)
+            if 'meas_events' in data.files:
+                events = data['meas_events']
+                # events 可能是 object array of dicts
+                for e in events:
+                    try:
+                        # 直接 dict
+                        meas_times_all.append(float(e['t_now']))
+                        n_active_all.append(int(e['n_active']))
+                    except Exception:
+                        try:
+                            # 有些情況需要 .item()
+                            meas_times_all.append(float(e.item().get('t_now')))
+                            n_active_all.append(int(d.get('n_active')))
+                        except Exception:
+                            pass
+        meas_times_all = np.array(meas_times_all, dtype=float) if len(meas_times_all) else np.empty((0,), dtype=float)
+        n_active_all   = np.array(n_active_all, dtype=int)   if len(n_active_all)   else np.empty((0,), dtype=int)
+        print(n_active_all)
+
+        # 僅畫在同一 x 範圍
+        if meas_times_all.size > 0:
+            mask = (meas_times_all >= t_plot[0]) & (meas_times_all <= t_plot[-1])
+            mt = meas_times_all[mask]
+            na = n_active_all[mask]
+        else:
+            mt = np.empty((0,), dtype=float)
+            na = np.empty((0,), dtype=int)
+
+        # 紅點沿 x 軸（y=0）
+        ax2.scatter(mt, na, color='red', s=12, label='measurement')
+        ax2.set_ylim(-1, 1)            # 留一些上下邊界，讓紅點看得到
+        ax2.set_yticks([])             # 不顯示 y 刻度
+        ax2.set_xlabel('timestamp (t_eval)')
+        ax2.set_ylabel('n_active')
+        ax2.grid(True, linestyle='--', alpha=0.4)
+        ax2.legend(loc='upper right')
+        
+        if na.size > 0:
+            ymax = int(max(na))
+            ymin = int(min(na))
+            ymin = min(ymin, 0)  # 讓 0 也可見
+            ax2.set_ylim(ymin - 0.5, ymax + 0.5)
+            ax2.set_yticks(range(ymin, ymax + 1))
+
+        # 4) 接著照你原本流程計算整體統計（平均/均方根等）
         lonerror = np.mean(np.mean(np.abs(T_gt_est[..., 0, 3]), axis=-1))
         laterror = np.mean(np.mean(np.abs(T_gt_est[..., 1, 3]), axis=-1))
-        poserrors = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)
         poserror = np.mean(np.mean(poserrors, axis=-1))
         posrmse = np.mean(np.sqrt(np.mean(poserrors**2, axis=-1)))
         angerrors = np.degrees(np.abs(
             np.array([util.ht2xyp(T)[:, 2] for T in T_gt_est])))
         angerror = np.mean(np.mean(angerrors, axis=-1))
         angrmse = np.mean(np.sqrt(np.mean(angerrors**2, axis=-1)))
-        stats.append({'session': sessionname, 'lonerror': lonerror, 
+
+        stats.append({'session': sessionname, 'lonerror': lonerror,
             'laterror': laterror, 'poserror': poserror, 'posrmse': posrmse,
             'angerror': angerror, 'angrmse': angrmse, 'T_gt_est': T_gt_est})
-        
-        # save figure
-        pos_errors_time = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)
-        mean_pos_errors = pos_errors_time.mean(axis=0)
-        plt.figure()
-        plt.plot(t_eval, mean_pos_errors, linewidth=2)
-        plt.xlabel('Time [s]')
-        plt.ylabel('Mean Position Error [m]')
-        plt.title(f'Session {sessionname} Position Error')
-        outdir = os.path.join(pynclt.resultdir, sessionname)
-        img_path = os.path.join(outdir, 'poserror_over_time.png')
-        plt.savefig(img_path, dpi=150)
-        plt.close()
-        
+
+        # 可選：立刻顯示或存圖
+        plt.tight_layout()
+        figpath = os.path.join(pynclt.resultdir, f"{sessionname}_poserror_meas.png")
+        plt.savefig(figpath, dpi=300)  # 儲存圖檔
+        plt.close(fig)
+
+    # 5) 存統計
     np.savez(os.path.join(pynclt.resultdir, get_evalfile()), stats=stats)
-    
+
+    # 6) 照舊輸出摘要列
     mapdata = np.load(os.path.join('nclt', get_globalmapname() + '.npz'))
     print('session \t f\te_pos \trmse_pos \te_ang \te_rmse')
     row = '{session} \t{f} \t{poserror} \t{posrmse} \t{angerror} \t{angrmse}'
@@ -591,7 +669,7 @@ if __name__ == '__main__':
         save_local_maps(session, use_desc=True)
         localize(session, visualize=False, use_desc=False)
 
-    plot_trajectories()
+    #plot_trajectories()
     evaluate()
     
     
