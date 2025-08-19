@@ -4,7 +4,7 @@ import util
 
 class particlefilter:
     def __init__(self, count, start, posrange, angrange, 
-            polemeans, polevar, descmap, descxy, descmap_index, edges, T_w_o=np.identity(4), d_max = 5.0):
+            polemeans, polevar, descmap, descxy, descmap_index, edges, quant, T_w_o=np.identity(4), d_max = 5.0):
         self.p_min = 0.01
         self.d_max = d_max
         self.minneff = 0.5
@@ -22,6 +22,7 @@ class particlefilter:
         self.descxy = descxy
         self.descmap_index = descmap_index
         self.edges = edges
+        self.quant = quant
         self.poledist = scipy.stats.norm(loc=0.0, scale=np.sqrt(polevar))
         self.kdtree = scipy.spatial.cKDTree(polemeans[:, :2], leafsize=3)
         self.T_w_o = T_w_o
@@ -37,7 +38,7 @@ class particlefilter:
         self.particles = np.matmul(self.particles, T_r0_r1)
 
     def update_measurement(self, desc, poleparams, resample=True):
-        matches = self.matcher(desc)
+        matches = self.matcher_quant(desc) if self.quant else self.matcher(desc)
         M = poleparams.shape[0]
         polepos_r = np.hstack([poleparams[:, :2], np.zeros([M, 1]), np.ones([M, 1])]).T
         
@@ -124,6 +125,37 @@ class particlefilter:
                 else:
                     diffs = np.abs(d1[common] - d2[common])
                     score = int((diffs <= 0.2).sum())
+                if score > best_score:
+                    best_score, best_j = score, j
+
+            matches.append((i, best_j))
+        return matches
+    
+    def matcher_quant(self, local_descs):
+        """
+        For each local descriptor row d1, find the index j of the global descriptor d2
+        that maximizes the count of matching nonzero slots within tolerance 0.2.
+        Returns a list of (i_local, j_global).
+        """
+        matches = []
+        nz_local  = local_descs != 0
+        nz_global = self.descmap != 0
+
+        for i, d1 in enumerate(local_descs):
+            bin_idx = np.searchsorted(self.edges, d1[0], side='right') - 1
+            bin_idx = max(0, min(bin_idx, 15))
+
+            best_j, best_score = -1, -1
+            mask1 = nz_local[i]
+
+            for j in self.descmap_index[bin_idx]:
+                d2 = self.descmap[j]
+                common = mask1 & nz_global[j]
+                if not np.any(common):
+                    score = 0
+                else:
+                    same = (d1[common] == d2[common])
+                    score = int(same.sum())
                 if score > best_score:
                     best_score, best_j = score, j
 

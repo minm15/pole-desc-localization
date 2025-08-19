@@ -10,13 +10,14 @@ import particlefilter
 import pynclt
 import util
 import poles_extractor
+import argparse
 
 mapextent = np.array([30.0, 30.0, 5.0])
 mapsize = np.full(3, 0.2)
 mapshape = np.array(mapextent / mapsize, dtype=np.int)
 mapinterval = 0.25
 mapdistance = 0.25
-remapdistance = 5.0
+remapdistance = 10.0
 n_mapdetections = 6
 n_locdetections = 2
 n_localmaps = 6
@@ -153,10 +154,7 @@ def save_global_map(use_desc=False):
                 vec = cluster_descs[i]
                 line = " ".join(f"{v:.2f}" for v in vec)
                 f_desc.write(line + "\n")
-            # for pole_idx in ci:
-            #     vec = descs_array[pole_idx]        # shape (180,)
-            #     line = " ".join(f"{v:.2f}" for v in vec)
-            #     f_desc.write(line + "\n")
+
             cid += 1
         
     globalmapfile = os.path.join('nclt', get_globalmapname() + '.npz')
@@ -240,17 +238,24 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             
     np.savez(os.path.join(session.dir, get_localmapfile()), maps=maps)
 
-def localize(sessionname, visualize=False, use_desc=False):
+def localize(sessionname, visualize=False, quant=False, quant_bits=None):
     print(sessionname)
+    print(f"[localize] quant={quant}")
     
     # load the global map data
     mapdata = np.load(os.path.join('nclt', get_globalmapname() + '.npz'))
     polemap = mapdata['polemeans'][:, :2]
     descmap = mapdata['descmeans']
     descxy = mapdata['polemeans'][:, :2]
-    # descmap = mapdata['descriptors']
-    # descxy = mapdata['allpole'][:, :2]
+    
+    qmap, thresholds = [], []
+    if quant:
+        qmap, thresholds = quantize_descmap(descmap, bits=quant_bits)
+    
     print(f"descmap size: {descmap.shape}, descxy size: {descxy.shape}")
+    print([f"{t:.10f}" for t in thresholds])
+    if quant:
+        print(f"qmap size: {qmap.shape}")
     polevar = 1.50
     
     # load the local map data
@@ -272,10 +277,10 @@ def localize(sessionname, visualize=False, use_desc=False):
         session.get_T_w_r_gt(session.t_relodo[istart]).dot(T_r_mc)).dot(T_mc_r)
     
     # construct the descmap index
-    descmap_index, edges = build_descmap_index(descmap, 16)
+    descmap_index, edges = build_descmap_index(qmap if quant else descmap, 16)
     
     filter = particlefilter.particlefilter(2000, 
-        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, descmap, descxy, descmap_index, edges, T_w_o=T_mc_r)
+        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
 
@@ -333,7 +338,10 @@ def localize(sessionname, visualize=False, use_desc=False):
                         T_r_now_r_mid = util.invert_ht(T_w_r_now).dot(T_w_r_mid)
                         polepos_r_now = T_r_now_r_mid.dot(T_r_m).dot(
                             polepos_m[imap][:, iactive])
-                        filter.update_measurement(desclocal[imap][iactive], polepos_r_now[:2].T)
+                        desc = desclocal[imap][iactive]   # shape=(110,)
+                        if quant:
+                            desc = quantize_descriptor(desc, thresholds)
+                        filter.update_measurement(desc, polepos_r_now[:2].T)
                         T_w_r_est[i] = filter.estimate_pose()
                         if visualize:
                             polepos_w_est = T_w_r_est[i].dot(polepos_r_now)
@@ -404,7 +412,6 @@ def evaluate():
 
         session = pynclt.session(sessionname)
 
-        # 1) 建 t_eval（距離→時間）與對應的 GT pose（與你原本一致）
         cumdist = np.hstack([0.0, np.cumsum(np.linalg.norm(np.diff(
             session.T_w_r_gt[:, :3, 3], axis=0), axis=1))])
         t_eval = scipy.interpolate.interp1d(
@@ -413,7 +420,6 @@ def evaluate():
                 session.get_T_w_r_gt(t).dot(T_r_mc)).dot(T_mc_r) \
                     for t in t_eval])
 
-        # 2) 內插各次估測到 t_eval 時間上
         T_gt_est = []
         for file in files:
             fpath = os.path.join(pynclt.resultdir, sessionname, file)
@@ -432,31 +438,25 @@ def evaluate():
                     T_w_r_est[iodo-1:iodo+1],
                     session.t_relodo[iodo-1:iodo+1], t_eval[ieval])
                 inum += 1
-            # 對齊上限 inum，避免尾端無效
             T_gt_est.append(
                 np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_interp)[:inum, ...]
             )
 
-        # 若有多個檔，堆成 [n_runs, L, 4, 4]
-        T_gt_est = np.stack(T_gt_est)  # L 會是 inum
+        T_gt_est = np.stack(T_gt_est)  
         L = T_gt_est.shape[1]
-        t_plot = t_eval[:L]  # 用來畫圖的時間軸
+        t_plot = t_eval[:L]  
 
-        # 3) 各 run 的逐時位置誤差 & 平均折線（會拿來畫藍色線）
         poserrors = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)  # [n_runs, L]
         poserror_mean = np.mean(poserrors, axis=0)                 # [L]
 
-        # === 這裡開始：加入兩張圖（上下排列、共用 x 軸） ===
         fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 6))
         fig.suptitle(f'Positional Error and Measurement Timestamps — {sessionname}')
 
-        # 上圖：poserror 折線（藍色）
         ax1.plot(t_plot, poserror_mean, color='blue', label='poserror (mean over runs)')
         ax1.set_ylabel('poserror (m)')
         ax1.grid(True, linestyle='--', alpha=0.4)
         ax1.legend(loc='upper right')
 
-        # 下圖：meas_events 的紅點（沿 x 軸）
         meas_times_all = []
         n_active_all = []
         for file in files:
@@ -464,24 +464,19 @@ def evaluate():
             data = np.load(fpath, allow_pickle=True)
             if 'meas_events' in data.files:
                 events = data['meas_events']
-                # events 可能是 object array of dicts
                 for e in events:
                     try:
-                        # 直接 dict
                         meas_times_all.append(float(e['t_now']))
                         n_active_all.append(int(e['n_active']))
                     except Exception:
                         try:
-                            # 有些情況需要 .item()
                             meas_times_all.append(float(e.item().get('t_now')))
                             n_active_all.append(int(d.get('n_active')))
                         except Exception:
                             pass
         meas_times_all = np.array(meas_times_all, dtype=float) if len(meas_times_all) else np.empty((0,), dtype=float)
         n_active_all   = np.array(n_active_all, dtype=int)   if len(n_active_all)   else np.empty((0,), dtype=int)
-        print(n_active_all)
 
-        # 僅畫在同一 x 範圍
         if meas_times_all.size > 0:
             mask = (meas_times_all >= t_plot[0]) & (meas_times_all <= t_plot[-1])
             mt = meas_times_all[mask]
@@ -490,10 +485,9 @@ def evaluate():
             mt = np.empty((0,), dtype=float)
             na = np.empty((0,), dtype=int)
 
-        # 紅點沿 x 軸（y=0）
         ax2.scatter(mt, na, color='red', s=12, label='measurement')
-        ax2.set_ylim(-1, 1)            # 留一些上下邊界，讓紅點看得到
-        ax2.set_yticks([])             # 不顯示 y 刻度
+        ax2.set_ylim(-1, 1)           
+        ax2.set_yticks([])            
         ax2.set_xlabel('timestamp (t_eval)')
         ax2.set_ylabel('n_active')
         ax2.grid(True, linestyle='--', alpha=0.4)
@@ -502,11 +496,10 @@ def evaluate():
         if na.size > 0:
             ymax = int(max(na))
             ymin = int(min(na))
-            ymin = min(ymin, 0)  # 讓 0 也可見
+            ymin = min(ymin, 0) 
             ax2.set_ylim(ymin - 0.5, ymax + 0.5)
             ax2.set_yticks(range(ymin, ymax + 1))
 
-        # 4) 接著照你原本流程計算整體統計（平均/均方根等）
         lonerror = np.mean(np.mean(np.abs(T_gt_est[..., 0, 3]), axis=-1))
         laterror = np.mean(np.mean(np.abs(T_gt_est[..., 1, 3]), axis=-1))
         poserror = np.mean(np.mean(poserrors, axis=-1))
@@ -520,16 +513,13 @@ def evaluate():
             'laterror': laterror, 'poserror': poserror, 'posrmse': posrmse,
             'angerror': angerror, 'angrmse': angrmse, 'T_gt_est': T_gt_est})
 
-        # 可選：立刻顯示或存圖
         plt.tight_layout()
         figpath = os.path.join(pynclt.resultdir, f"{sessionname}_poserror_meas.png")
-        plt.savefig(figpath, dpi=300)  # 儲存圖檔
+        plt.savefig(figpath, dpi=300) 
         plt.close(fig)
 
-    # 5) 存統計
     np.savez(os.path.join(pynclt.resultdir, get_evalfile()), stats=stats)
 
-    # 6) 照舊輸出摘要列
     mapdata = np.load(os.path.join('nclt', get_globalmapname() + '.npz'))
     print('session \t f\te_pos \trmse_pos \te_ang \te_rmse')
     row = '{session} \t{f} \t{poserror} \t{posrmse} \t{angerror} \t{angrmse}'
@@ -662,12 +652,107 @@ def build_descmap_index(descmap, k):
     
     return descmap_index, edges
 
+def quantize_descmap(descmap: np.ndarray, bits: int = 6):
+    """
+    Quantize a (N, 110) floating-point descriptor array into integer buckets
+    using equal-frequency (quantile) binning.
+
+    Parameters
+    ----------
+    descmap : np.ndarray, shape=(N, 110)
+        Original floating-point descriptor array.
+    bits : int
+        Quantization bit-width. Total buckets = 2^bits.
+
+    Returns
+    -------
+    qmap : np.ndarray, shape=(N, 110), dtype=int
+    thresholds : np.ndarray, shape=(2^bits - 2,)
+    """
+    if bits < 1:
+        raise ValueError("bits must be >= 1")
+
+    num_buckets = 1 << bits               # 2^bits
+    if num_buckets < 2:
+        # With 1 bucket total, only 0 would make sense; disallow
+        raise ValueError("bits too small for quantization")
+
+    flat = descmap.ravel()
+    nonzero_mask = (flat != 0.0)
+    nonzeros = flat[nonzero_mask]
+
+    if nonzeros.size == 0:
+        # All zeros → everything maps to bucket 0; thresholds are empty.
+        return np.zeros_like(descmap, dtype=int), np.array([])
+
+    # For non-zeros, we create (num_buckets - 1) buckets via (num_buckets - 2) thresholds.
+    # Quantiles: 1/num_buckets, 2/num_buckets, ..., (num_buckets-1)/num_buckets
+    quantiles = np.linspace(0.0, 1.0, num_buckets)[1:-1]  # exclude 0 and 1
+    thresholds = np.quantile(nonzeros, quantiles)
+
+    # Digitize non-zeros: indices in [0 .. len(thresholds)]
+    idx = np.digitize(nonzeros, thresholds, right=False)
+
+    # Shift by +1 to allocate codes 1..(num_buckets-1) for non-zeros
+    qvals = idx + 1
+
+    # Build output array
+    qflat = np.zeros_like(flat, dtype=int)
+    qflat[nonzero_mask] = qvals
+
+    qmap = qflat.reshape(descmap.shape)
+    return qmap, thresholds
+
+def quantize_descriptor(vec: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+    """
+    Quantize a single descriptor vector (shape (110,)) using precomputed thresholds.
+
+    Mapping:
+      - Exact 0.0 → bucket 0
+      - Non-zero values → np.digitize(value, thresholds) + 1
+        which yields an integer bucket in [1, len(thresholds)+1]
+
+    Parameters
+    ----------
+    vec : np.ndarray, shape=(110,)
+        Floating-point descriptor vector.
+    thresholds : np.ndarray, shape=(2^bits - 2,)
+        Quantile thresholds returned by `quantize_descmap`.
+
+    Returns
+    -------
+    q : np.ndarray, shape=(110,), dtype=int
+        Quantized integer vector.
+    """
+    q = np.zeros_like(vec, dtype=int)
+    nz = (vec != 0.0)
+    if thresholds.size > 0:  # normal case
+        idxs = np.digitize(vec[nz], thresholds, right=False)
+        q[nz] = idxs + 1
+    else:
+        # thresholds empty means everything was zero in the dataset;
+        # keep zeros (already initialized)
+        pass
+    return q
 
 if __name__ == '__main__':
-    save_global_map(use_desc=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--quant', nargs='?', const=6, type=int, help='Enable quant mode with specified bits (default: 6)')
+    args = parser.parse_args()
+    
+    if args.quant is None:
+        do_quant = False
+        quant_bits = None
+    else:
+        do_quant = True
+        quant_bits = args.quant
+        
+    print(f"Quantization enabled? {do_quant}, bits={quant_bits}")
+    
+    #save_global_map(use_desc=True)
     for session in pynclt.sessions:
-        save_local_maps(session, use_desc=True)
-        localize(session, visualize=False, use_desc=False)
+        #save_local_maps(session, use_desc=True)
+        localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits)
 
     #plot_trajectories()
     evaluate()
