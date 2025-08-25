@@ -4,7 +4,7 @@ import util
 
 class particlefilter:
     def __init__(self, count, start, posrange, angrange, 
-            polemeans, polevar, descmap, descxy, descmap_index, edges, quant, T_w_o=np.identity(4), d_max = 5.0):
+            polemeans, polevar, descmap, descxy, descmap_index, edges, quant, T_w_o=np.identity(4), d_max = 2.0):
         self.p_min = 0.01
         self.d_max = d_max
         self.minneff = 0.5
@@ -60,13 +60,29 @@ class particlefilter:
         diffs = polepos_w_all[:, :2, :] - desc_sub.T[None, :, :]         # broadcast → (count, 2, M)
         dists = np.linalg.norm(diffs, axis=1)                            # (count, M)
         dists = np.minimum(dists, self.d_max)  
-        # print('dist: \n', dists[0])
+        #print('dist: \n', dists[0])
 
         weights_factor = np.prod(self.poledist.pdf(dists) + 0.2, axis=1) # shape (count,)
 
         self.weights *= weights_factor
         
         self.weights /= np.sum(self.weights)
+        if resample and self.neff < self.minneff:
+            self.resample()
+            
+    def update_measurement_knn(self, poleparams, resample=True):
+        n = poleparams.shape[0]
+        polepos_r = np.hstack(
+            [poleparams[:, :2], np.zeros([n, 1]), np.ones([n, 1])]).T
+        for i in range(self.count):
+            polepos_w = self.particles[i].dot(polepos_r)
+            d, _ = self.kdtree.query(
+                polepos_w[:2].T, k=1, distance_upper_bound=1.0)
+            #print('dist: ', d)
+            self.weights[i] *= np.prod(
+                self.poledist.pdf(np.clip(d, 0.0, 1.0)) + 0.2)
+        self.weights /= np.sum(self.weights)
+
         if resample and self.neff < self.minneff:
             self.resample()
 
@@ -112,7 +128,7 @@ class particlefilter:
 
         for i, d1 in enumerate(local_descs):
             bin_idx = np.searchsorted(self.edges, d1[0], side='right') - 1
-            bin_idx = max(0, min(bin_idx, 15))
+            bin_idx = max(0, min(bin_idx, 3))
 
             best_j, best_score = -1, -1
             mask1 = nz_local[i]
@@ -143,7 +159,7 @@ class particlefilter:
 
         for i, d1 in enumerate(local_descs):
             bin_idx = np.searchsorted(self.edges, d1[0], side='right') - 1
-            bin_idx = max(0, min(bin_idx, 15))
+            bin_idx = max(0, min(bin_idx, 3))
 
             best_j, best_score = -1, -1
             mask1 = nz_local[i]

@@ -241,6 +241,7 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
 def localize(sessionname, visualize=False, quant=False, quant_bits=None):
     print(sessionname)
     print(f"[localize] quant={quant}")
+    append_count = 0
     
     # load the global map data
     mapdata = np.load(os.path.join('nclt', get_globalmapname() + '.npz'))
@@ -277,12 +278,19 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
         session.get_T_w_r_gt(session.t_relodo[istart]).dot(T_r_mc)).dot(T_mc_r)
     
     # construct the descmap index
-    descmap_index, edges = build_descmap_index(qmap if quant else descmap, 16)
+    descmap_index, edges = build_descmap_index(qmap if quant else descmap, 4)
     
+    ### descriptor filter ###
     filter = particlefilter.particlefilter(2000, 
         T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
+    
+    ### knn filter ###
+    knn_filter = particlefilter.particlefilter(500, 
+        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
+    knn_filter.estimatetype = 'best'
+    knn_filter.minneff = 0.5
 
     if visualize:
         plt.ion()
@@ -306,6 +314,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
             session.t_velo[locdata[imap]['iend']] < session.t_relodo[istart]:
         imap += 1
     T_w_r_est = np.full([session.t_relodo.size, 4, 4], np.nan)
+    T_w_r_est_knn = np.full([session.t_relodo.size, 4, 4], np.nan)
     with progressbar.ProgressBar(max_value=session.t_relodo.size) as bar:
         for i in range(istart, session.t_relodo.size):
             relodocov = np.empty([3, 3])
@@ -314,6 +323,11 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
             relodocov[2, :] = session.relodocov[i, 5, [0, 1, 5]]
             filter.update_motion(session.relodo[i], relodocov * 2.0**2)
             T_w_r_est[i] = filter.estimate_pose()
+            
+            ### knn filter ###
+            knn_filter.update_motion(session.relodo[i], relodocov * 2.0**2)
+            T_w_r_est_knn[i] = knn_filter.estimate_pose()
+            
             t_now = session.t_relodo[i]
             if imap < locdata.shape[0]:
                 t_end = session.t_velo[locdata[imap]['iend']]
@@ -329,6 +343,13 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
                         if len(ci) >= n_locdetections:
                             iactive |= set(ipoles) & ci
                     iactive = list(iactive)
+                    
+                    meas_events.append({
+                        't_now': float(t_now), 
+                        'n_active': int(len(iactive))
+                    })
+                    append_count += 1
+                    
                     if len(iactive) >= 4:
                         t_mid = session.t_velo[locdata[imap]['imid']]
                         T_w_r_mid = util.project_xy(session.get_T_w_r_odo(
@@ -346,11 +367,22 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
                         if visualize:
                             polepos_w_est = T_w_r_est[i].dot(polepos_r_now)
                             locpoles.set_offsets(polepos_w_est[:2].T)
-                            
-                        meas_events.append({
-                            't_now': float(t_now), 
-                            'n_active': int(len(iactive))
-                        })
+                    
+                    ### knn filter measurement update ###   
+                    if iactive:
+                        t_mid = session.t_velo[locdata[imap]['imid']]
+                        T_w_r_mid = util.project_xy(session.get_T_w_r_odo(
+                            t_mid).dot(T_r_mc)).dot(T_mc_r)
+                        T_w_r_now = util.project_xy(session.get_T_w_r_odo(
+                            t_now).dot(T_r_mc)).dot(T_mc_r)
+                        T_r_now_r_mid = util.invert_ht(T_w_r_now).dot(T_w_r_mid)
+                        polepos_r_now = T_r_now_r_mid.dot(T_r_m).dot(
+                            polepos_m[imap][:, iactive])
+                        knn_filter.update_measurement_knn(polepos_r_now[:2].T)
+                        T_w_r_est_knn[i] = knn_filter.estimate_pose()
+                        if visualize:
+                            polepos_w_est = T_w_r_est_knn[i].dot(polepos_r_now)
+                            locpoles.set_offsets(polepos_w_est[:2].T)
 
                     imap += 1
             
@@ -365,7 +397,9 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
             bar.update(i)
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))
-    np.savez(filename, T_w_r_est=T_w_r_est, meas_events=np.array(meas_events, dtype=object),)
+    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object),)
+    
+    print('append_count', append_count)
 
 def plot_trajectories():
     trajectorydir = os.path.join(
@@ -420,11 +454,13 @@ def evaluate():
                 session.get_T_w_r_gt(t).dot(T_r_mc)).dot(T_mc_r) \
                     for t in t_eval])
 
-        T_gt_est = []
+        T_gt_est, T_gt_est_knn = [], []
         for file in files:
             fpath = os.path.join(pynclt.resultdir, sessionname, file)
             T_w_r_est = np.load(fpath)['T_w_r_est']  # [N_relodo, 4, 4]
+            T_w_r_est_knn = np.load(fpath)['T_w_r_est_knn']  # knn filter
             T_w_r_est_interp = np.empty([len(t_eval), 4, 4])
+            T_w_r_est_knn_interp = np.empty([len(t_eval), 4, 4]) # knn filter
             iodo = 1
             inum = 0
             for ieval in range(len(t_eval)):
@@ -437,72 +473,43 @@ def evaluate():
                 T_w_r_est_interp[ieval] = util.interpolate_ht(
                     T_w_r_est[iodo-1:iodo+1],
                     session.t_relodo[iodo-1:iodo+1], t_eval[ieval])
+                
+                # knn filter
+                T_w_r_est_knn_interp[ieval] = util.interpolate_ht(
+                    T_w_r_est_knn[iodo-1:iodo+1],
+                    session.t_relodo[iodo-1:iodo+1], t_eval[ieval])
                 inum += 1
             T_gt_est.append(
                 np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_interp)[:inum, ...]
             )
-
-        T_gt_est = np.stack(T_gt_est)  
+            
+            # knn filter
+            T_gt_est_knn.append(
+                np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_knn_interp)[:inum, ...]
+            )
+            
+        T_gt_est = np.stack(T_gt_est) 
+        T_gt_est_knn = np.stack(T_gt_est_knn) 
         L = T_gt_est.shape[1]
         t_plot = t_eval[:L]  
 
         poserrors = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)  # [n_runs, L]
         poserror_mean = np.mean(poserrors, axis=0)                 # [L]
+        poserrors_knn = np.linalg.norm(T_gt_est_knn[..., :2, 3], axis=-1)  # [n_runs, L]
+        poserror_mean_knn = np.mean(poserrors_knn, axis=0)                 # [L]
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 6))
-        fig.suptitle(f'Positional Error and Measurement Timestamps — {sessionname}')
-
-        ax1.plot(t_plot, poserror_mean, color='blue', label='poserror (mean over runs)')
-        ax1.set_ylabel('poserror (m)')
-        ax1.grid(True, linestyle='--', alpha=0.4)
-        ax1.legend(loc='upper right')
-
-        meas_times_all = []
-        n_active_all = []
-        for file in files:
-            fpath = os.path.join(pynclt.resultdir, sessionname, file)
-            data = np.load(fpath, allow_pickle=True)
-            if 'meas_events' in data.files:
-                events = data['meas_events']
-                for e in events:
-                    try:
-                        meas_times_all.append(float(e['t_now']))
-                        n_active_all.append(int(e['n_active']))
-                    except Exception:
-                        try:
-                            meas_times_all.append(float(e.item().get('t_now')))
-                            n_active_all.append(int(d.get('n_active')))
-                        except Exception:
-                            pass
-        meas_times_all = np.array(meas_times_all, dtype=float) if len(meas_times_all) else np.empty((0,), dtype=float)
-        n_active_all   = np.array(n_active_all, dtype=int)   if len(n_active_all)   else np.empty((0,), dtype=int)
-
-        if meas_times_all.size > 0:
-            mask = (meas_times_all >= t_plot[0]) & (meas_times_all <= t_plot[-1])
-            mt = meas_times_all[mask]
-            na = n_active_all[mask]
-        else:
-            mt = np.empty((0,), dtype=float)
-            na = np.empty((0,), dtype=int)
-
-        ax2.scatter(mt, na, color='red', s=12, label='measurement')
-        ax2.set_ylim(-1, 1)           
-        ax2.set_yticks([])            
-        ax2.set_xlabel('timestamp (t_eval)')
-        ax2.set_ylabel('n_active')
-        ax2.grid(True, linestyle='--', alpha=0.4)
-        ax2.legend(loc='upper right')
-        
-        if na.size > 0:
-            ymax = int(max(na))
-            ymin = int(min(na))
-            ymin = min(ymin, 0) 
-            ax2.set_ylim(ymin - 0.5, ymax + 0.5)
-            ax2.set_yticks(range(ymin, ymax + 1))
+        # plot the evaluation result
+        plot_evaluation_result(sessionname=sessionname, 
+                               poserror_mean=poserror_mean, 
+                               poserror_mean_knn=poserror_mean_knn,
+                               t_plot=t_plot, 
+                               files=files)
 
         lonerror = np.mean(np.mean(np.abs(T_gt_est[..., 0, 3]), axis=-1))
         laterror = np.mean(np.mean(np.abs(T_gt_est[..., 1, 3]), axis=-1))
         poserror = np.mean(np.mean(poserrors, axis=-1))
+        poserror_knn = np.mean(np.mean(poserrors_knn, axis=-1)) # knn
+        print(poserror, poserror_knn)
         posrmse = np.mean(np.sqrt(np.mean(poserrors**2, axis=-1)))
         angerrors = np.degrees(np.abs(
             np.array([util.ht2xyp(T)[:, 2] for T in T_gt_est])))
@@ -512,11 +519,6 @@ def evaluate():
         stats.append({'session': sessionname, 'lonerror': lonerror,
             'laterror': laterror, 'poserror': poserror, 'posrmse': posrmse,
             'angerror': angerror, 'angrmse': angrmse, 'T_gt_est': T_gt_est})
-
-        plt.tight_layout()
-        figpath = os.path.join(pynclt.resultdir, f"{sessionname}_poserror_meas.png")
-        plt.savefig(figpath, dpi=300) 
-        plt.close(fig)
 
     np.savez(os.path.join(pynclt.resultdir, get_evalfile()), stats=stats)
 
@@ -531,6 +533,80 @@ def evaluate():
             posrmse=stat['posrmse'],
             angerror=stat['angerror'],
             angrmse=stat['angrmse']))
+        
+def plot_evaluation_result(sessionname, poserror_mean, poserror_mean_knn, t_plot, files):
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, figsize=(10, 8))
+    fig.suptitle(f'Positional Error and Measurement Timestamps — {sessionname}')
+
+    # ax1: baseline pos error
+    ax1.plot(t_plot, poserror_mean, color='blue', label='poserror (mean over runs)')
+    ax1.set_ylabel('poserror (m)')
+    ax1.grid(True, linestyle='--', alpha=0.4)
+    ax1.legend(loc='upper right')
+
+    # ax2: kNN pos error
+    ax2.plot(t_plot, poserror_mean_knn, color='green', label='poserror (kNN mean over runs)')
+    ax2.set_ylabel('poserror (m)')
+    ax2.grid(True, linestyle='--', alpha=0.4)
+    ax2.legend(loc='upper right')
+
+    meas_times_all = []
+    n_active_all = []
+    for file in files:
+        fpath = os.path.join(pynclt.resultdir, sessionname, file)
+        data = np.load(fpath, allow_pickle=True)
+        if 'meas_events' in data.files:
+            events = data['meas_events']
+            for e in events:
+                try:
+                    if isinstance(e, dict):
+                        t_now = float(e.get('t_now'))
+                        n_act = int(e.get('n_active'))
+                    else:
+                        ei = e.item() if hasattr(e, 'item') else {}
+                        t_now = float(ei.get('t_now'))
+                        n_act = int(ei.get('n_active'))
+                    meas_times_all.append(t_now)
+                    n_active_all.append(n_act)
+                except Exception:
+                    pass
+
+    meas_times_all = np.array(meas_times_all, dtype=float) if len(meas_times_all) else np.empty((0,), dtype=float)
+    n_active_all   = np.array(n_active_all, dtype=int)   if len(n_active_all)   else np.empty((0,), dtype=int)
+    print(meas_times_all.shape, n_active_all.shape)
+
+    if meas_times_all.size > 0:
+        mask = (meas_times_all >= t_plot[0]) & (meas_times_all <= t_plot[-1])
+        mt = meas_times_all[mask]
+        na = n_active_all[mask]
+    else:
+        mt = np.empty((0,), dtype=float)
+        na = np.empty((0,), dtype=int)
+
+    # ax3
+    ax3.set_xlabel('timestamp (t_eval)')
+    ax3.set_ylabel('n_active')
+    ax3.grid(True, linestyle='--', alpha=0.4)
+
+    if na.size > 0:
+        ax3.plot(mt, na, label='n_active (measurement)', linewidth=1.2)
+        ax3.legend(loc='upper right')
+
+        ymin = int(np.floor(na.min()))
+        ymax = int(np.ceil(na.max()))
+        ymin = min(ymin, 0)  
+        if ymin == ymax:
+            ymax = ymin + 1
+        ax3.set_ylim(ymin - 0.5, ymax + 0.5)
+
+        if (ymax - ymin) <= 20:
+            ax3.set_yticks(range(ymin, ymax + 1))
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    figpath = os.path.join(pynclt.resultdir, f"{sessionname}_poserror_meas.png")
+    plt.savefig(figpath, dpi=300)
+    plt.close(fig)
         
 def merge_cluster_descriptors(poleparams, descs_array, threshold=0.2):
     """
