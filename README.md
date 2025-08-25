@@ -12,25 +12,33 @@ sudo apt install -y make build-essential libssl-dev zlib1g-dev \
 
 ## B. Add the following environment setup in the ~/.bashrc
 ```export PYENV_ROOT="$HOME/.pyenv"```
+
 ```export PATH="$PYENV_ROOT/bin:$PATH"```
+
 ```eval "$(pyenv init --path)"```
+
 ```eval "$(pyenv init -)"```
 
 ## C. Check and install the available pyenv version
 ```pyenv install --list | grep -E "^  3\.8\.[0-9]+$"```
+
 ```pyenv install 3.8.20```
+
 ```pyenv versions```
 
 ## D. Change the python version
 ```pyenv global 3.8.20```
+
 ```python --version```
 
 ## E. Create the venv
 ```python -m venv .env```
+
 ```source .env/bin/activate```
 
 # 2. Install the requirement package
 ```pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124```
+
 ```pip install -r requirements.txt```
 
 # 3. Run the nclt localization
