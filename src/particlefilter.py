@@ -115,65 +115,63 @@ class particlefilter:
             pos += 1.0 / self.count
         self.particles = self.particles[idx]
         self.weights[:] = 1.0 / self.count
+        
+    def _score_tol_nonzero(self, q: np.ndarray, C: np.ndarray, tol: float = 0.2) -> np.ndarray:
+        """
+        Tolerance & non-zero score for non-quantized descriptors:
+        score = count of dims where both non-zero and |C - q| <= tol
+        """
+        nz = (C != 0) & (q[None, :] != 0)
+        diffs = np.abs(C - q[None, :])
+        return (nz & (diffs <= tol)).sum(axis=1)
+
+    def _score_equal_nonzero(self, q: np.ndarray, C: np.ndarray) -> np.ndarray:
+        """
+        Equal & non-zero score for quantized descriptors:
+        score = count of dims where both non-zero and C == q
+        """
+        nz = (C != 0)
+        eq = (C == q[None, :])
+        return (eq & nz).sum(axis=1)
     
-    def matcher(self, local_descs):
+    def matcher(self, local_descs: np.ndarray):
         """
-        For each local descriptor row d1, find the index j of the global descriptor d2
-        that maximizes the count of matching nonzero slots within tolerance 0.2.
-        Returns a list of (i_local, j_global).
+        IVF-only matcher for non-quantized descriptors.
+        For each local row, retrieve ALL candidates from the probed lists (no cap),
+        score with tolerance & non-zero, pick the best row index.
+        Returns: List[(i_local, j_global_row)]
         """
-        matches = []
-        nz_local  = local_descs != 0
-        nz_global = self.descmap != 0
-
+        matches: list[tuple[int, int]] = []
+        ivf = self.descmap_index  # KMeansIVF object
         for i, d1 in enumerate(local_descs):
-            bin_idx = np.searchsorted(self.edges, d1[0], side='right') - 1
-            bin_idx = max(0, min(bin_idx, 3))
-
-            best_j, best_score = -1, -1
-            mask1 = nz_local[i]
-
-            for j in self.descmap_index[bin_idx]:
-                d2 = self.descmap[j]
-                common = mask1 & nz_global[j]
-                if not np.any(common):
-                    score = 0
-                else:
-                    diffs = np.abs(d1[common] - d2[common])
-                    score = int((diffs <= 0.2).sum())
-                if score > best_score:
-                    best_score, best_j = score, j
-
-            matches.append((i, best_j))
+            # candidates_for_query with max_cands=None -> no cap; dedup=True is fine since map_id == row index
+            cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
+            if not cand_rows:
+                matches.append((i, -1))
+                continue
+            C = self.descmap[cand_rows]  # (K,64)
+            scores = self._score_tol_nonzero(d1, C, tol=0.2)
+            best_k = int(np.argmax(scores))
+            matches.append((i, int(cand_rows[best_k])))
         return matches
-    
-    def matcher_quant(self, local_descs):
-        """
-        For each local descriptor row d1, find the index j of the global descriptor d2
-        that maximizes the count of matching nonzero slots within tolerance 0.2.
-        Returns a list of (i_local, j_global).
-        """
-        matches = []
-        nz_local  = local_descs != 0
-        nz_global = self.descmap != 0
 
+
+    def matcher_quant(self, local_descs: np.ndarray):
+        """
+        IVF-only matcher for quantized descriptors.
+        For each local row, retrieve ALL candidates from the probed lists (no cap),
+        score with equal & non-zero, pick the best row index.
+        Returns: List[(i_local, j_global_row)]
+        """
+        matches: list[tuple[int, int]] = []
+        ivf = self.descmap_index  # KMeansIVF object
         for i, d1 in enumerate(local_descs):
-            bin_idx = np.searchsorted(self.edges, d1[0], side='right') - 1
-            bin_idx = max(0, min(bin_idx, 3))
-
-            best_j, best_score = -1, -1
-            mask1 = nz_local[i]
-
-            for j in self.descmap_index[bin_idx]:
-                d2 = self.descmap[j]
-                common = mask1 & nz_global[j]
-                if not np.any(common):
-                    score = 0
-                else:
-                    same = (d1[common] == d2[common])
-                    score = int(same.sum())
-                if score > best_score:
-                    best_score, best_j = score, j
-
-            matches.append((i, best_j))
+            cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
+            if not cand_rows:
+                matches.append((i, -1))
+                continue
+            C = self.descmap[cand_rows]  # (K,64)
+            scores = self._score_equal_nonzero(d1, C)
+            best_k = int(np.argmax(scores))
+            matches.append((i, int(cand_rows[best_k])))
         return matches

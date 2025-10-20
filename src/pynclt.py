@@ -13,8 +13,8 @@ T_o_w = util.invert_ht(T_w_o)
 eulerdef = 'sxyz'
 
 csvdelimiter = ','
-# datadir = '/home/kaiii/nas/homes/kaiii_data/nclt_IEEE2021_format/data'
-datadir = '/data/kaiii/nclt/data'
+datadir = '/home/kaiii/nas/homes/kaiii_data/nclt_IEEE2021_format/data'
+# datadir = '/data/kaiii/nclt/data'
 resultdir = 'nclt'
 snapshotfile = 'snapshot.npz'
 sessionfile = 'sessiondata_sata.npz'
@@ -35,16 +35,16 @@ sessions = [
     # '2012-04-29',
     # '2012-05-11',
     # '2012-05-26',
-    # '2012-06-15',
-    # '2012-08-04',
+    # '2012-06-15'
+    '2012-08-04'
     # '2012-08-20',
     # '2012-09-28',
-    # '2012-10-28',
+    # '2012-10-28'
     # '2012-11-04',
     # '2012-11-16',
     # '2012-11-17',
     # '2012-12-01',
-    '2013-01-10',
+    # '2013-01-10'
     # '2013-02-23',
     # '2013-04-05'
     ]

@@ -426,7 +426,7 @@ def compute_link3d_descriptor(keypoints):
     return descriptors: np.ndarray of shape (N, D)
     """
     N = keypoints.shape[0]
-    D = 110
+    D = 64
     descriptors = np.zeros((N, D), dtype=np.float32)
     if N < 4:
         return descriptors

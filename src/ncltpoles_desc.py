@@ -120,7 +120,7 @@ def save_global_map(use_desc=False):
     a = poleparams[:, [2]]
     boxes = np.hstack([xy - a, xy + a])
     clustermeans = np.empty([0, 3])
-    cluster_descs = np.empty((0,110))
+    cluster_descs = np.empty((0,64))
     descs_array = np.vstack(all_descs)
     print(poleparams.shape, descs_array.shape)
     

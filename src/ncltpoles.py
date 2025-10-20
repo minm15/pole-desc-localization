@@ -11,6 +11,7 @@ import pynclt
 import util
 import poles_extractor
 import argparse
+from kmeans_ivf import KMeansIVF
 
 mapextent = np.array([30.0, 30.0, 5.0])
 mapsize = np.full(3, 0.2)
@@ -121,7 +122,7 @@ def save_global_map(use_desc=False):
     a = poleparams[:, [2]]
     boxes = np.hstack([xy - a, xy + a])
     clustermeans = np.empty([0, 3])
-    clusterdescs = np.empty((0,110))
+    clusterdescs = np.empty((0,64))
     descs_array = np.vstack(all_descs)
     print(poleparams.shape, descs_array.shape)
     
@@ -160,7 +161,6 @@ def save_global_map(use_desc=False):
     globalmapfile = os.path.join('nclt', get_globalmapname() + '.npz')
     allglobalmapfile = os.path.join('nclt', get_globalmapname() + '_all' + '.npz')
     if use_desc:
-        # concat all_descs (list of (Ni,180)) 成 (sum Ni,180)
         all_descs = np.vstack(all_descs)
         np.savez(globalmapfile,
                  polemeans=clustermeans,
@@ -278,10 +278,16 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
         session.get_T_w_r_gt(session.t_relodo[istart]).dot(T_r_mc)).dot(T_mc_r)
     
     # construct the descmap index
-    descmap_index, edges = build_descmap_index(qmap if quant else descmap, 4)
+    desc_source = qmap if quant else descmap                    # shape (N,64) uint8
+    map_ids = np.arange(desc_source.shape[0], dtype=np.int64)
+    ivf = KMeansIVF()           
+    build_stats = ivf.build(desc_source, map_ids=map_ids)
+    print("[IVF] build stats:", build_stats)
+    #descmap_index, edges = build_descmap_index(qmap if quant else descmap, 4)
+    descmap_index, edges = ivf, None
     
     ### descriptor filter ###
-    filter = particlefilter.particlefilter(2000, 
+    filter = particlefilter.particlefilter(5000, 
         T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
@@ -338,6 +344,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
                         for ld in locdata[imaps]])
                     boxes = np.hstack([xy - a, xy + a])
                     ipoles = set(range(polepos_w[imap].shape[1]))
+                    # iactive = ipoles
                     iactive = set()
                     for ci in cluster.cluster_boxes(boxes):
                         if len(ci) >= n_locdetections:
@@ -350,7 +357,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
                     })
                     append_count += 1
                     
-                    if len(iactive) >= 4:
+                    if len(iactive) >= 2:
                         t_mid = session.t_velo[locdata[imap]['imid']]
                         T_w_r_mid = util.project_xy(session.get_T_w_r_odo(
                             t_mid).dot(T_r_mc)).dot(T_mc_r)
@@ -618,6 +625,10 @@ def merge_cluster_descriptors(poleparams, descs_array, threshold=0.2):
       cluster_means: list of np.ndarray (shape (3,))  M x 3
       cluster_descs: list of np.ndarray (shape (D,))  M x D
     """
+    # directly return input
+    keep = np.any(descs_array != 0, axis=1)  
+    return poleparams[keep], descs_array[keep]
+    
     N, D = descs_array.shape
 
     # mask zero-only descriptors
