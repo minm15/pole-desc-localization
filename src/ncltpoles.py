@@ -238,7 +238,7 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             
     np.savez(os.path.join(session.dir, get_localmapfile()), maps=maps)
 
-def localize(sessionname, visualize=False, quant=False, quant_bits=None):
+def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nlist=None, ivf_nprobe=None):
     print(sessionname)
     print(f"[localize] quant={quant}")
     append_count = 0
@@ -280,7 +280,16 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None):
     # construct the descmap index
     desc_source = qmap if quant else descmap                    # shape (N,64) uint8
     map_ids = np.arange(desc_source.shape[0], dtype=np.int64)
-    ivf = KMeansIVF()           
+    ivf = KMeansIVF()
+    # read ivf argument   
+    if ivf_nlist is not None:
+        if ivf_nlist < 1:
+            raise ValueError("--nlist must be >= 1")
+        ivf.nlist = ivf_nlist
+    if ivf_nprobe is not None:
+        if ivf_nprobe < 1:
+            raise ValueError("--nprobe must be >= 1")
+        ivf.nprobe = ivf_nprobe        
     build_stats = ivf.build(desc_source, map_ids=map_ids)
     print("[IVF] build stats:", build_stats)
     #descmap_index, edges = build_descmap_index(qmap if quant else descmap, 4)
@@ -825,6 +834,12 @@ def quantize_descriptor(vec: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--quant', nargs='?', const=6, type=int, help='Enable quant mode with specified bits (default: 6)')
+    parser.add_argument('--nlist', type=int, default=None,
+                        help='FAISS IVF nlist (number of centroids/lists). '
+                             'Default: use KMeansIVF default.')
+    parser.add_argument('--nprobe', type=int, default=None,
+                        help='FAISS IVF nprobe (lists to probe per query). '
+                             'Default: use KMeansIVF default.')
     args = parser.parse_args()
     
     if args.quant is None:
@@ -835,11 +850,13 @@ if __name__ == '__main__':
         quant_bits = args.quant
         
     print(f"Quantization enabled? {do_quant}, bits={quant_bits}")
+    ivf_nlist  = args.nlist
+    ivf_nprobe = args.nprobe
     
     #save_global_map(use_desc=True)
     for session in pynclt.sessions:
         #save_local_maps(session, use_desc=True)
-        localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits)
+        localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
 
     #plot_trajectories()
     evaluate()
