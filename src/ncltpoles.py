@@ -1,5 +1,5 @@
 import datetime
-import os
+import os, glob
 import matplotlib.pyplot as plt
 import numpy as np
 import progressbar
@@ -11,6 +11,7 @@ import pynclt
 import util
 import poles_extractor
 import argparse
+import time
 from kmeans_ivf import KMeansIVF
 
 mapextent = np.array([30.0, 30.0, 5.0])
@@ -201,6 +202,8 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
     istart, imid, iend = get_map_indices(session)
     maps = []
     all_descs = []
+    tim_detect_ms = []
+    ts_localmaps = []
     with progressbar.ProgressBar(max_value=len(iend)) as bar:
         for i in range(len(iend)):
             T_w_mc = util.project_xy(
@@ -215,12 +218,15 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             iscan = imid[i]
             xyz, _ = session.get_velo(iscan)
             
+            t0 = time.perf_counter_ns()
             if use_desc:
                 poleparams, desc = poles_extractor.detect_poles(
                     xyz, desc=True)
                 all_descs.append(desc)
             else:
                 poleparams = poles_extractor.detect_poles(xyz)
+            tim_detect_ms.append((time.perf_counter_ns() - t0) / 1e6)
+            ts_localmaps.append(session.t_velo[imid[i]])
 
             # poleparams = poles_extractor.detect_poles(xyz)
             localpoleparam_xy = poleparams[:, :2]
@@ -236,7 +242,9 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             maps.append(map)
             bar.update(i)
             
-    np.savez(os.path.join(session.dir, get_localmapfile()), maps=maps)
+    np.savez(os.path.join(session.dir, get_localmapfile()), maps=maps,
+             tim_detect_ms=np.array(tim_detect_ms, dtype=np.float32),
+             ts_localmaps=np.asarray(ts_localmaps, dtype=np.float64))
 
 def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nlist=None, ivf_nprobe=None):
     print(sessionname)
@@ -330,18 +338,36 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
         imap += 1
     T_w_r_est = np.full([session.t_relodo.size, 4, 4], np.nan)
     T_w_r_est_knn = np.full([session.t_relodo.size, 4, 4], np.nan)
+    T = session.t_relodo.size
+    tim_total_ms            = np.zeros(T, dtype=np.float32) 
+    tim_update_measurement_ms = np.zeros(T, dtype=np.float32) 
+    tim_estimate_pose_ms    = np.zeros(T, dtype=np.float32)
+    tim_knn_update_ms       = np.zeros(T, dtype=np.float32)
+    tim_knn_measurement_ms  = np.zeros(T, dtype=np.float32)
+    tim_knn_estimate_ms     = np.zeros(T, dtype=np.float32)
+    n_active_per_step         = np.zeros(T, dtype=np.int32)
     with progressbar.ProgressBar(max_value=session.t_relodo.size) as bar:
         for i in range(istart, session.t_relodo.size):
+            t_step0_ns = time.perf_counter_ns()
+            
             relodocov = np.empty([3, 3])
             relodocov[:2, :2] = session.relodocov[i, :2, :2]
             relodocov[:, 2] = session.relodocov[i, [0, 1, 5], 5]
             relodocov[2, :] = session.relodocov[i, 5, [0, 1, 5]]
             filter.update_motion(session.relodo[i], relodocov * 2.0**2)
+            
+            t0_ns = time.perf_counter_ns()
             T_w_r_est[i] = filter.estimate_pose()
+            tim_estimate_pose_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
             
             ### knn filter ###
+            t0_ns = time.perf_counter_ns()
             knn_filter.update_motion(session.relodo[i], relodocov * 2.0**2)
+            tim_knn_update_ms[i] = (time.perf_counter_ns() - t0_ns) / 1e6
+
+            t0_ns = time.perf_counter_ns()
             T_w_r_est_knn[i] = knn_filter.estimate_pose()
+            tim_knn_estimate_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
             
             t_now = session.t_relodo[i]
             if imap < locdata.shape[0]:
@@ -367,6 +393,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                     append_count += 1
                     
                     if len(iactive) >= 2:
+                        n_active_per_step[i] = len(iactive)
                         t_mid = session.t_velo[locdata[imap]['imid']]
                         T_w_r_mid = util.project_xy(session.get_T_w_r_odo(
                             t_mid).dot(T_r_mc)).dot(T_mc_r)
@@ -378,8 +405,12 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                         desc = desclocal[imap][iactive]   # shape=(110,)
                         if quant:
                             desc = quantize_descriptor(desc, thresholds)
+                        t0_ns = time.perf_counter_ns()
                         filter.update_measurement(desc, polepos_r_now[:2].T)
+                        tim_update_measurement_ms[i] = (time.perf_counter_ns() - t0_ns) / 1e6
+                        t0_ns = time.perf_counter_ns()
                         T_w_r_est[i] = filter.estimate_pose()
+                        tim_estimate_pose_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
                         if visualize:
                             polepos_w_est = T_w_r_est[i].dot(polepos_r_now)
                             locpoles.set_offsets(polepos_w_est[:2].T)
@@ -394,8 +425,13 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                         T_r_now_r_mid = util.invert_ht(T_w_r_now).dot(T_w_r_mid)
                         polepos_r_now = T_r_now_r_mid.dot(T_r_m).dot(
                             polepos_m[imap][:, iactive])
+                        t0_ns = time.perf_counter_ns()
                         knn_filter.update_measurement_knn(polepos_r_now[:2].T)
+                        tim_knn_measurement_ms[i] = (time.perf_counter_ns() - t0_ns) / 1e6
+
+                        t0_ns = time.perf_counter_ns()
                         T_w_r_est_knn[i] = knn_filter.estimate_pose()
+                        tim_knn_estimate_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
                         if visualize:
                             polepos_w_est = T_w_r_est_knn[i].dot(polepos_r_now)
                             locpoles.set_offsets(polepos_w_est[:2].T)
@@ -410,10 +446,14 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                 mapaxes.set_ylim(bottom=y - viewoffset, top=y + viewoffset)
                 figure.canvas.draw_idle()
                 figure.canvas.flush_events()
+            tim_total_ms[i] = (time.perf_counter_ns() - t_step0_ns) / 1e6
             bar.update(i)
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))
-    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object),)
+    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object),
+            tim_total_ms=tim_total_ms, tim_update_measurement_ms=tim_update_measurement_ms, tim_estimate_pose_ms=tim_estimate_pose_ms,
+            tim_knn_update_ms=tim_knn_update_ms, tim_knn_measurement_ms=tim_knn_measurement_ms, tim_knn_estimate_ms=tim_knn_estimate_ms,
+            n_active_per_step=n_active_per_step,)
     
     print('append_count', append_count)
 
@@ -831,6 +871,410 @@ def quantize_descriptor(vec: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
         pass
     return q
 
+def plot_timing_stacked_for_sessions(
+    sessions,
+    base_dir="nclt",
+    mask_measurement_only=True,
+    max_bars=3000,
+):
+    """
+    Stacked time series bar chart per session:
+      x-axis: timestamp (from meas_events.t_now when available; else step index)
+      y-axis: time per step (ms)
+      stack:  update_measurement (bottom) + estimate_pose + kNN(total) + other
+
+    Mask: by default only steps with tim_update_measurement_ms > 0.
+    Downsampling: if steps > max_bars, group by stride and plot group means.
+
+    Output per session: nclt/{session}/timing_stacked4_{session}.png
+    """
+    for sess in sessions:
+        sess_dir = os.path.join(base_dir, sess)
+        paths = sorted(glob.glob(os.path.join(sess_dir, "localization*.npz")))
+        if not paths:
+            print(f"[timing] skip: no localization*.npz in {sess_dir}")
+            continue
+
+        fpath = paths[0]
+        try:
+            data = np.load(fpath, allow_pickle=True)
+        except Exception as e:
+            print(f"[timing] skip: failed to load {fpath}: {e}")
+            continue
+
+        required = ["tim_total_ms", "tim_update_measurement_ms", "tim_estimate_pose_ms"]
+        if not all(k in data.files for k in required):
+            print(f"[timing] skip: {fpath} missing required arrays {required}")
+            continue
+
+        total    = data["tim_total_ms"].astype(np.float32)
+        update   = data["tim_update_measurement_ms"].astype(np.float32)
+        estimate = data["tim_estimate_pose_ms"].astype(np.float32)
+
+        # kNN parts are optional; default to zeros when missing
+        knn_u = data["tim_knn_update_ms"].astype(np.float32)        if "tim_knn_update_ms" in data.files else np.zeros_like(total)
+        knn_m = data["tim_knn_measurement_ms"].astype(np.float32)   if "tim_knn_measurement_ms" in data.files else np.zeros_like(total)
+        knn_e = data["tim_knn_estimate_ms"].astype(np.float32)      if "tim_knn_estimate_ms" in data.files else np.zeros_like(total)
+        knn = knn_u + knn_m + knn_e
+        
+        n_active = data["n_active_per_step"].astype(np.float32) if "n_active_per_step" in data.files else None
+
+        # mask: only measurement steps by default
+        mask = (update > 0.0) if mask_measurement_only else np.ones_like(update, dtype=bool)
+        if not np.any(mask):
+            print(f"[timing] skip: no steps after masking in {fpath}")
+            continue
+
+        total_m, update_m, estimate_m, knn_msk = total[mask], update[mask], estimate[mask], knn[mask]
+        other_m = np.maximum(0.0, total_m - update_m - estimate_m - knn_msk)
+
+        # timestamps: prefer meas_events.t_now if it matches, otherwise use masked indices
+        ts = None
+        if "meas_events" in data.files:
+            try:
+                ev = data["meas_events"]
+                t_list = []
+                for e in ev:
+                    try:
+                        d = e if isinstance(e, dict) else (e.item() if hasattr(e, "item") else {})
+                        t_list.append(float(d.get("t_now")))
+                    except Exception:
+                        pass
+                t_arr = np.array(t_list, dtype=float)
+                if t_arr.size == total_m.size:
+                    ts = t_arr
+            except Exception:
+                pass
+        if ts is None:
+            ts = np.flatnonzero(mask).astype(float)
+
+        # downsample if too many bars (group means)
+        n = total_m.size
+        stride = int(np.ceil(n / max(1, max_bars)))
+        if stride > 1:
+            g = (n // stride) * stride
+
+            def group_mean(a):
+                return a[:g].reshape(-1, stride).mean(axis=1)
+
+            ts_plot       = group_mean(ts)
+            update_plot   = group_mean(update_m)
+            estimate_plot = group_mean(estimate_m)
+            knn_plot      = group_mean(knn_msk)
+            other_plot    = group_mean(other_m)
+            count_used    = ts_plot.size
+            
+            if n_active is not None:
+                n_active_plot = group_mean(n_active[mask])
+            else:
+                n_active_plot = None
+        else:
+            ts_plot, update_plot, estimate_plot, knn_plot, other_plot = ts, update_m, estimate_m, knn_msk, other_m
+            count_used = ts_plot.size
+            n_active_plot = n_active[mask] if n_active is not None else None
+
+        # bar width from timestamp spacing
+        if ts_plot.size >= 2:
+            dt = np.diff(ts_plot).mean()
+            width = dt * 0.9 if dt > 0 else 1.0
+        else:
+            width = 1.0
+
+        # stacked bars: update (bottom) + estimate + knn + other
+        fig, ax = plt.subplots(figsize=(12, 5))
+        b0 = update_plot
+        b1 = b0 + estimate_plot
+        b2 = b1 + knn_plot
+        ax.bar(ts_plot, update_plot,   width=width, label="update_measurement (ms)")
+        ax.bar(ts_plot, estimate_plot, width=width, bottom=b0, label="estimate_pose (ms)")
+        ax.bar(ts_plot, knn_plot,      width=width, bottom=b1, label="kNN total (ms)")
+        ax.bar(ts_plot, other_plot,    width=width, bottom=b2, label="other (ms)")
+        ax.set_xlabel("timestamp")
+        ax.set_ylabel("time per step (ms)")
+        ax.grid(True, linestyle="--", alpha=0.35)
+
+        if n_active_plot is not None and n_active_plot.size == ts_plot.size:
+            ax2 = ax.twinx()
+            ax2.plot(ts_plot, n_active_plot, linewidth=1.0, color="k", alpha=0.7, label="n_active")
+            ax2.set_ylabel("n_active (count)")
+            lines, labels = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines + lines2, labels + labels2, loc="upper right")
+        else:
+            ax.legend(loc="upper right")
+
+        plt.tight_layout()
+        out_path = os.path.join(sess_dir, f"timing_stacked4_{sess}.png")
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+        print(f"[timing] saved: {out_path}  (bars={count_used}, stride={stride})")
+        
+def report_max_timing_for_sessions(
+    sessions,
+    base_dir="nclt",
+    mask_measurement_only=True,
+    max_bars=3000, 
+):
+    """
+    For each session:
+      - load nclt/{session}/localization*.npz
+      - mask to measurement steps if requested
+      - find the step with maximum tim_total_ms
+      - print timestamp and breakdown (update/estimate/kNN/other/total) to stdout
+    """
+    import os, glob
+    import numpy as np
+
+    for sess in sessions:
+        sess_dir = os.path.join(base_dir, sess)
+        paths = sorted(glob.glob(os.path.join(sess_dir, "localization*.npz")))
+        if not paths:
+            print(f"[max-timing] skip: no localization*.npz in {sess_dir}")
+            continue
+
+        fpath = paths[0]
+        try:
+            data = np.load(fpath, allow_pickle=True)
+        except Exception as e:
+            print(f"[max-timing] skip: failed to load {fpath}: {e}")
+            continue
+
+        required = ["tim_total_ms", "tim_update_measurement_ms", "tim_estimate_pose_ms"]
+        if not all(k in data.files for k in required):
+            print(f"[max-timing] skip: {fpath} missing required arrays {required}")
+            continue
+
+        total    = data["tim_total_ms"].astype(np.float64)
+        update   = data["tim_update_measurement_ms"].astype(np.float64)
+        estimate = data["tim_estimate_pose_ms"].astype(np.float64)
+
+        # kNN parts are optional
+        knn_u = data["tim_knn_update_ms"].astype(np.float64)       if "tim_knn_update_ms" in data.files else np.zeros_like(total)
+        knn_m = data["tim_knn_measurement_ms"].astype(np.float64)  if "tim_knn_measurement_ms" in data.files else np.zeros_like(total)
+        knn_e = data["tim_knn_estimate_ms"].astype(np.float64)     if "tim_knn_estimate_ms" in data.files else np.zeros_like(total)
+        knn = knn_u + knn_m + knn_e
+
+        # mask: measurement-only or all steps
+        mask = (update > 0.0) if mask_measurement_only else np.ones_like(update, dtype=bool)
+        if not np.any(mask):
+            print(f"[max-timing] skip: no steps after masking in {fpath}")
+            continue
+
+        total_m, update_m, estimate_m, knn_m = total[mask], update[mask], estimate[mask], knn[mask]
+        other_m = np.maximum(0.0, total_m - update_m - estimate_m - knn_m)
+
+        # timestamps: prefer meas_events.t_now if it matches masked length
+        ts = None
+        if "meas_events" in data.files:
+            try:
+                ev = data["meas_events"]
+                t_list = []
+                for e in ev:
+                    try:
+                        d = e if isinstance(e, dict) else (e.item() if hasattr(e, "item") else {})
+                        t_list.append(float(d.get("t_now")))
+                    except Exception:
+                        pass
+                t_arr = np.array(t_list, dtype=float)
+                if t_arr.size == total_m.size:
+                    ts = t_arr
+            except Exception:
+                pass
+        if ts is None:
+            ts = np.flatnonzero(mask).astype(float)  # fallback: masked step indices
+
+        # find argmax on masked total
+        k = int(np.argmax(total_m))
+        tstamp   = float(ts[k])
+        tot_ms   = float(total_m[k])
+        upd_ms   = float(update_m[k])
+        est_ms   = float(estimate_m[k])
+        knn_ms   = float(knn_m[k])
+        oth_ms   = max(0.0, tot_ms - upd_ms - est_ms - knn_ms)
+
+        orig_idx = int(np.flatnonzero(mask)[k])
+
+        print(
+            f"[max-timing] session={sess}  orig_step={orig_idx}  timestamp={tstamp:.6f}  "
+            f"total={tot_ms:.3f} ms  "
+            f"update={upd_ms:.3f} ms  estimate={est_ms:.3f} ms  kNN={knn_ms:.3f} ms  other={oth_ms:.3f} ms"
+        )
+        
+def plot_detect_timeline_for_sessions(
+    sessions,
+    base_dir="nclt",
+    max_bars=3000,
+    smooth_window=None,
+):
+    """
+    Time-series bar chart of pole-detect time per local map, one figure per session.
+
+    x-axis: timestamp per local map (from 'ts_localmaps' if present; else index)
+    y-axis: detection time per local map (ms), drawn as bars
+    Downsampling: if number of bars > max_bars, group by stride and plot group means
+    Optional smoothing line: running mean with a centered window (smooth_window)
+
+    Input NPZ (first match of 'localmaps*.npz' in the session dir) is expected to contain:
+      - tim_detect_ms: float array of shape (N_localmaps,)
+      - ts_localmaps:  float array of shape (N_localmaps,)   [optional but recommended]
+    """
+    def running_mean(a, w):
+        if w is None or w <= 1:
+            return a
+        # centered running mean; trim edges to keep same length as a
+        k = w // 2
+        c = np.cumsum(np.pad(a, (1, 0), mode="constant"))
+        m = (c[w:] - c[:-w]) / float(w)
+        # pad to original length
+        left  = np.full(k, m[0], dtype=a.dtype)
+        right = np.full(a.size - m.size - k, m[-1], dtype=a.dtype)
+        return np.concatenate([left, m, right])
+
+    for sess in sessions:
+        sess_dir = os.path.join(base_dir, sess)
+        paths = sorted(glob.glob(os.path.join(sess_dir, "localmaps*.npz")))
+        if not paths:
+            print(f"[detect-timeline] skip: no localmaps*.npz in {sess_dir}")
+            continue
+
+        fpath = paths[0]
+        try:
+            data = np.load(fpath, allow_pickle=True)
+        except Exception as e:
+            print(f"[detect-timeline] skip: failed to load {fpath}: {e}")
+            continue
+
+        if "tim_detect_ms" not in data.files:
+            print(f"[detect-timeline] skip: {fpath} missing 'tim_detect_ms'")
+            continue
+
+        detect = data["tim_detect_ms"].astype(np.float32)
+        # Preferred timestamps if present
+        if "ts_localmaps" in data.files:
+            ts = data["ts_localmaps"].astype(np.float64)
+        else:
+            # Fallback: use dense indices as x
+            ts = np.arange(detect.size, dtype=np.float64)
+
+        if ts.size != detect.size:
+            # Size mismatch safety: fall back to indices
+            print(f"[detect-timeline] warn: ts length != detect length in {fpath}; fallback to index x-axis")
+            ts = np.arange(detect.size, dtype=np.float64)
+
+        n = detect.size
+        stride = int(np.ceil(n / max(1, max_bars)))
+        if stride > 1:
+            # group means to reduce bars
+            g = (n // stride) * stride
+
+            def group_mean(a):
+                return a[:g].reshape(-1, stride).mean(axis=1)
+
+            ts_plot     = group_mean(ts)
+            detect_plot = group_mean(detect)
+            count_used  = ts_plot.size
+        else:
+            ts_plot, detect_plot = ts, detect
+            count_used = ts_plot.size
+
+        # Choose a reasonable bar width from timestamp spacing
+        if ts_plot.size >= 2:
+            dt = np.diff(ts_plot).mean()
+            width = dt * 0.9 if dt > 0 else 1.0
+        else:
+            width = 1.0
+
+        # Optional smoothing line (running mean)
+        smooth = running_mean(detect_plot, smooth_window)
+
+        # Plot
+        plt.figure(figsize=(12, 4.5))
+        plt.bar(ts_plot, detect_plot, width=width, label="detect time (ms)")
+        if smooth_window and smooth_window > 1:
+            plt.plot(ts_plot, smooth, linewidth=1.25, label=f"running mean (w={smooth_window})")
+        title = (f"Pole-detect time over time — {sess}\n"
+                 f"N={int(n)} local maps{' (downsampled)' if stride>1 else ''}")
+        plt.title(title)
+        plt.xlabel("timestamp")
+        plt.ylabel("time per local map (ms)")
+        plt.grid(True, linestyle="--", alpha=0.35)
+        plt.legend(loc="upper right")
+        plt.tight_layout()
+
+        out_path = os.path.join(sess_dir, f"detect_timeline_{sess}.png")
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+        print(f"[detect-timeline] saved: {out_path}  (bars={count_used}, stride={stride})")
+        
+        
+def report_pole_detect_timing_for_sessions(
+    sessions,
+    base_dir="nclt",
+    drop_zeros=True,
+    percentiles=(90, 95, 99),
+):
+    """
+    For each session, read nclt/{session}/localmaps_*.npz and print a timing summary
+    for tim_detect_ms:
+      - N / mean / median / std / min / {percentiles} / max
+      - Index of the max in the original array (local map index)
+    """
+    for sess in sessions:
+        sess_dir = os.path.join(base_dir, sess)
+        paths = sorted(glob.glob(os.path.join(sess_dir, "localmaps_*.npz")))
+        if not paths:
+            print(f"[detect-report] skip: no localmaps*.npz in {sess_dir}")
+            continue
+
+        fpath = paths[0]
+        try:
+            data = np.load(fpath, allow_pickle=True)
+        except Exception as e:
+            print(f"[detect-report] skip: failed to load {fpath}: {e}")
+            continue
+
+        if "tim_detect_ms" not in data.files:
+            print(f"[detect-report] skip: {fpath} has no 'tim_detect_ms'")
+            continue
+
+        arr = data["tim_detect_ms"].astype(np.float32)
+
+        # Keep finite values; optionally drop zeros.
+        mask = np.isfinite(arr)
+        if drop_zeros:
+            mask &= (arr > 0.0)
+
+        if not np.any(mask):
+            print(f"[detect-report] skip: no valid times after masking in {fpath}")
+            continue
+
+        t = arr[mask]
+        n = t.size
+        mean_v = float(np.mean(t))
+        med_v  = float(np.median(t))
+        std_v  = float(np.std(t))
+        min_v  = float(np.min(t))
+        max_v  = float(np.max(t))
+
+        # Map the argmax in the masked array back to the original index.
+        idx_in_masked = int(np.argmax(t))
+        orig_indices  = np.flatnonzero(mask)
+        max_idx_orig  = int(orig_indices[idx_in_masked])
+
+        # Requested percentiles.
+        pct_vals = {}
+        for p in percentiles:
+            try:
+                pct_vals[p] = float(np.percentile(t, p))
+            except Exception:
+                pct_vals[p] = float("nan")
+
+        pcts_str = " ".join([f"p{p}={pct_vals[p]:.2f}ms" for p in percentiles])
+        print(
+            f"[detect-report] session={sess}  N={n}  mean={mean_v:.2f}ms  median={med_v:.2f}ms  "
+            f"std={std_v:.2f}ms  min={min_v:.2f}ms  max={max_v:.2f}ms (map_idx={max_idx_orig})  {pcts_str}"
+        )
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--quant', nargs='?', const=6, type=int, help='Enable quant mode with specified bits (default: 6)')
@@ -855,11 +1299,16 @@ if __name__ == '__main__':
     
     #save_global_map(use_desc=True)
     for session in pynclt.sessions:
-        #save_local_maps(session, use_desc=True)
-        localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        save_local_maps(session, use_desc=True)
+        #localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
 
     #plot_trajectories()
-    evaluate()
+    #evaluate()
+    
+    plot_timing_stacked_for_sessions(pynclt.sessions, base_dir="nclt")
+    report_max_timing_for_sessions(pynclt.sessions, base_dir="nclt")
+    plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
+    report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")
     
     
 # for session in sessions:

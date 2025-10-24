@@ -6,3 +6,6 @@ kitti
 reports/
 visualizations/
 plots/
+ivf_2x4_panel.png
+ivf_summary_sessions_update_epos.csv
+output.txt
