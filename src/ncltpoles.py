@@ -13,6 +13,7 @@ import poles_extractor
 import argparse
 import time
 from kmeans_ivf import KMeansIVF
+from zeroAwareIVF import ZeroAwareIVF
 
 mapextent = np.array([30.0, 30.0, 5.0])
 mapsize = np.full(3, 0.2)
@@ -288,7 +289,8 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     # construct the descmap index
     desc_source = qmap if quant else descmap                    # shape (N,64) uint8
     map_ids = np.arange(desc_source.shape[0], dtype=np.int64)
-    ivf = KMeansIVF()
+    #ivf = KMeansIVF()
+    ivf = ZeroAwareIVF()
     # read ivf argument   
     if ivf_nlist is not None:
         if ivf_nlist < 1:
@@ -1299,16 +1301,16 @@ if __name__ == '__main__':
     
     #save_global_map(use_desc=True)
     for session in pynclt.sessions:
-        save_local_maps(session, use_desc=True)
-        #localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        #save_local_maps(session, use_desc=True)
+        localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
 
     #plot_trajectories()
-    #evaluate()
+    evaluate()
     
     plot_timing_stacked_for_sessions(pynclt.sessions, base_dir="nclt")
     report_max_timing_for_sessions(pynclt.sessions, base_dir="nclt")
-    plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
-    report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")
+    # plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
+    # report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")
     
     
 # for session in sessions:

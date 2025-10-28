@@ -62,9 +62,9 @@ def main(csv_path: str, out_path: str, linthresh: float = 60.0):
             ax.plot(x_pos, d["value"].tolist(), marker="o", linewidth=1.5, label=sess)
 
         # Labels
-        ax.set_xlabel("nlist (categorical)")
+        ax.set_xlabel("nlist")
         if j == 0:
-            ax.set_ylabel("Update time (ms, symlog)")
+            ax.set_ylabel("Update time (ms)")
         ax.set_xticks(x_pos)
         ax.set_xticklabels(x_labels)
 
