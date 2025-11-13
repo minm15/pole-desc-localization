@@ -402,7 +402,7 @@ def evaluate():
 
 
 if __name__ == '__main__':
-    save_global_map()
+    #save_global_map()
     for session in pynclt.sessions[args.session_start:args.session_end]:
         save_local_maps(session)
         localize(session, visualize=False)

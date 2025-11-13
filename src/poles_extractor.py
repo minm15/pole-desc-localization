@@ -98,8 +98,8 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
 
         return poleparams
 
-
-def detect_poles(xyz, neighbourthr = 0.5, min_point_num = 2, dis_thr = 0.08, width_thr = 20, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.2, highthr = 0.5, totalthr = 0.4, vis=False, desc=False):
+# xyz, neighbourthr = 0.5, min_point_num = 2, dis_thr = 0.08, width_thr = 20, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.2, highthr = 0.5, totalthr = 0.4, vis=False, desc=False
+def detect_poles(xyz, neighbourthr = 0.5, min_point_num = 3, dis_thr = 0.08, width_thr = 10, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.5, highthr = 0.7, totalthr = 0.6, vis=False, desc=False):
     range_data, proj_vertex, _ = range_projection(xyz,
                                                 fov_up=fov_up,
                                                 fov_down=fov_down,

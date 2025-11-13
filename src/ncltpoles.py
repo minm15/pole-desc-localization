@@ -12,6 +12,7 @@ import util
 import poles_extractor
 import argparse
 import time
+import collections
 from kmeans_ivf import KMeansIVF
 from zeroAwareIVF import ZeroAwareIVF
 
@@ -75,112 +76,314 @@ def get_map_indices(session):
     return istart[:len(iend)], imid[:len(iend)], iend
 
 
+# def save_global_map(use_desc=False):
+#     globalmappos = np.empty([0, 2])
+#     mapfactors = np.full(len(pynclt.sessions), np.nan)
+#     poleparams = np.empty([0, 3])
+#     all_descs = []
+#     for isession, s in enumerate(pynclt.sessions):
+#         print(s)
+#         session = pynclt.session(s)
+#         istart, imid, iend = get_map_indices(session)
+#         localmappos = session.T_w_r_gt_velo[imid, :2, 3]
+#         if globalmappos.size == 0:
+#             imaps = range(localmappos.shape[0])
+#         else:
+#             imaps = []
+#             for imap in range(localmappos.shape[0]):
+#                 distance = np.linalg.norm(
+#                     localmappos[imap] - globalmappos, axis=1).min()
+#                 if distance > remapdistance:
+#                     imaps.append(imap)
+#         globalmappos = np.vstack([globalmappos, localmappos[imaps]])
+#         mapfactors[isession] = np.true_divide(len(imaps), len(imid))
+
+#         with progressbar.ProgressBar(max_value=len(imaps)) as bar:
+#             for iimap, imap in enumerate(imaps):
+#                 iscan = imid[imap]
+#                 xyz, _ = session.get_velo(iscan)
+                
+#                 if use_desc:
+#                     localpoleparam, desc = poles_extractor.detect_poles(
+#                         xyz, desc=True)
+#                     # if len(desc) < 4: continue 
+#                     all_descs.append(desc)
+#                 else:
+#                     localpoleparam = poles_extractor.detect_poles(xyz)
+
+#                 # localpoleparam = poles_extractor.detect_poles(xyz)
+#                 localpoleparam_xy = localpoleparam[:, :2]
+#                 localpoleparam_xy = localpoleparam_xy.T
+#                 localpoleparam_xy = np.vstack([localpoleparam_xy, np.zeros_like(localpoleparam_xy[0]), np.ones_like(localpoleparam_xy[0])]) #4*n
+#                 localpoleparam_xy = np.matmul(session.T_w_r_gt_velo[imid[imap]], localpoleparam_xy)
+#                 localpoleparam[:, :2] = localpoleparam_xy[:2,:].T
+#                 poleparams = np.vstack([poleparams, localpoleparam])
+
+#                 bar.update(iimap)
+
+#     xy = poleparams[:, :2]
+#     a = poleparams[:, [2]]
+#     boxes = np.hstack([xy - a, xy + a])
+#     clustermeans = np.empty([0, 3])
+#     clusterdescs = np.empty((0,64))
+#     descs_array = np.vstack(all_descs)
+#     print(poleparams.shape, descs_array.shape)
+    
+#     desc_txt_path = os.path.join(session.dir, 'cluster_descriptors.txt')
+#     cid = 0
+#     with open(desc_txt_path, 'w') as f_desc:
+    
+#         for ci in cluster.cluster_boxes(boxes):
+#             ci = list(ci)
+#             if len(ci) < n_mapdetections:
+#                 continue
+            
+#             # build my mean pole and descriptor
+#             local_poleparams = poleparams[ci, :]      # (Nc, 3)
+#             local_descs = descs_array[ci, :]
+            
+#             cluster_means, cluster_descs = merge_cluster_descriptors(
+#                 local_poleparams,
+#                 local_descs,
+#                 threshold=0.2
+#             )
+#             clustermeans = np.vstack([clustermeans, cluster_means])
+#             clusterdescs = np.vstack([clusterdescs, cluster_descs])
+            
+#             # clustermeans = np.vstack([clustermeans, np.average(poleparams[ci, :], axis=0)])
+#             # cluster_descs = np.vstack([cluster_descs, np.mean(descs_array[ci, :], axis=0)])
+            
+#             f_desc.write(f"c{cid}\n")
+#             for i in range(len(cluster_descs)):
+#                 vec = cluster_descs[i]
+#                 line = " ".join(f"{v:.2f}" for v in vec)
+#                 f_desc.write(line + "\n")
+
+#             cid += 1
+        
+#     globalmapfile = os.path.join('nclt', get_globalmapname() + '.npz')
+#     allglobalmapfile = os.path.join('nclt', get_globalmapname() + '_all' + '.npz')
+#     if use_desc:
+#         all_descs = np.vstack(all_descs)
+#         np.savez(globalmapfile,
+#                  polemeans=clustermeans,
+#                  descmeans=clusterdescs,
+#                  mapfactors=mapfactors,
+#                  mappos=globalmappos,
+#                  allpole=poleparams,
+#                  descriptors=descs_array)
+        
+#         # np.savez(allglobalmapfile, polemeans=xy, descriptors=descs_array)
+#         print(f"allpole.shape: {poleparams.shape}, descriptors.shape: {descs_array.shape}")
+#         print(f"polemeans.shape: {clustermeans.shape}, descmeans.shape: {clusterdescs.shape}")
+        
+#     else:
+#         np.savez(globalmapfile,
+#                  polemeans=clustermeans,
+#                  mapfactors=mapfactors,
+#                  mappos=globalmappos)
+#     plot_global_map(globalmapfile)
+
+def _score_based_feature_match(new_pole, new_desc, global_poles, global_descs,
+                               pos_thresh, score_thresh, score_tol):
+    """
+    Checks if a new feature exists in the global map using a position-first,
+    score-second logic.
+
+    A match (i.e., it's a DUPLICATE) is found if:
+    1. Any global_pole is within pos_thresh of new_pole.
+    2. AND any of those position candidates also has a descriptor score
+       >= score_thresh.
+
+    Returns:
+        int: The index of the best matching feature, or -1 if no match.
+    """
+    if global_poles.shape[0] == 0:
+        return -1  # Global map is empty
+
+    # 1. Filter by Position FIRST
+    pos_dists = np.linalg.norm(global_poles[:, :2] - new_pole[:2], axis=1)
+    
+    # Get all indices that are within the position threshold
+    position_candidate_indices = np.where(pos_dists < pos_thresh)[0]
+
+    if position_candidate_indices.size == 0:
+        # No features are physically nearby, so this is a new feature.
+        return -1
+
+    # 2. Filter by Score SECOND
+    # We only check the descriptors of the nearby candidates
+    nearby_descs = global_descs[position_candidate_indices]
+
+    # Calculate scores for only these nearby candidates
+    non_zero_mask = (nearby_descs != 0) & (new_desc != 0)
+    tolerance_mask = np.abs(nearby_descs - new_desc) <= score_tol
+    
+    # scores is a 1D array (size k) for nearby candidates
+    scores = np.sum(non_zero_mask & tolerance_mask, axis=1)
+
+    # 3. Decision
+    # Check if ANY of the nearby candidates meet the score threshold
+    passing_scores_mask = (scores >= score_thresh)
+    
+    if np.any(passing_scores_mask):
+        # A match was found. At least one nearby feature also looks like me.
+        # This is a duplicate.
+        
+        # (Optional) We can return the index of the *best* match among
+        # the candidates, just for completeness.
+        passing_indices_local = np.where(passing_scores_mask)[0]
+        best_local_idx = passing_indices_local[np.argmax(scores[passing_scores_mask])]
+        best_global_idx = position_candidate_indices[best_local_idx]
+        return best_global_idx
+    else:
+        # All nearby features were dissimilar (failed the score test).
+        # This is a new feature.
+        return -1
+
+
 def save_global_map(use_desc=False):
-    globalmappos = np.empty([0, 2])
+    """
+    Incrementally builds the global feature map using position-first, 
+    score-based matching. (This is your improved scheme)
+    """
+    if not use_desc:
+        raise ValueError("The incremental save_global_map logic requires use_desc=True")
+
+    # --- Thresholds for matching features (Tune these as needed) ---
+    POS_MATCH_THRESHOLD_METERS = 10.0
+    DESC_SCORE_TOLERANCE = 0.2
+    DESC_MIN_SCORE_THRESHOLD = 2
+
+    # --- Incremental global map variables ---
+    global_clustermeans = np.empty([0, 3])
+    global_clusterdescs = np.empty((0, 64))
+    global_mappos = np.empty([0, 2])
     mapfactors = np.full(len(pynclt.sessions), np.nan)
-    poleparams = np.empty([0, 3])
-    all_descs = []
+    all_raw_poles_list = []
+    all_raw_descs_list = []
+
     for isession, s in enumerate(pynclt.sessions):
         print(s)
         session = pynclt.session(s)
         istart, imid, iend = get_map_indices(session)
-        localmappos = session.T_w_r_gt_velo[imid, :2, 3]
-        if globalmappos.size == 0:
-            imaps = range(localmappos.shape[0])
-        else:
-            imaps = []
-            for imap in range(localmappos.shape[0]):
-                distance = np.linalg.norm(
-                    localmappos[imap] - globalmappos, axis=1).min()
-                if distance > remapdistance:
-                    imaps.append(imap)
-        globalmappos = np.vstack([globalmappos, localmappos[imaps]])
-        mapfactors[isession] = np.true_divide(len(imaps), len(imid))
+        session_features_detected = 0
+        session_features_added = 0
+        session_mappos_contributed = []
+        imaps = range(len(imid))
 
         with progressbar.ProgressBar(max_value=len(imaps)) as bar:
-            for iimap, imap in enumerate(imaps):
-                iscan = imid[imap]
+            for iimap in imaps:
+                iscan = imid[iimap]
                 xyz, _ = session.get_velo(iscan)
                 
-                if use_desc:
-                    localpoleparam, desc = poles_extractor.detect_poles(
-                        xyz, desc=True)
-                    # if len(desc) < 4: continue 
-                    all_descs.append(desc)
-                else:
-                    localpoleparam = poles_extractor.detect_poles(xyz)
+                localpoleparam, desc = poles_extractor.detect_poles(
+                    xyz, desc=True)
+                
+                if localpoleparam.shape[0] == 0:
+                    bar.update(iimap)
+                    continue
 
-                # localpoleparam = poles_extractor.detect_poles(xyz)
-                localpoleparam_xy = localpoleparam[:, :2]
-                localpoleparam_xy = localpoleparam_xy.T
-                localpoleparam_xy = np.vstack([localpoleparam_xy, np.zeros_like(localpoleparam_xy[0]), np.ones_like(localpoleparam_xy[0])]) #4*n
-                localpoleparam_xy = np.matmul(session.T_w_r_gt_velo[imid[imap]], localpoleparam_xy)
-                localpoleparam[:, :2] = localpoleparam_xy[:2,:].T
-                poleparams = np.vstack([poleparams, localpoleparam])
+                localpoleparam_xy_local = localpoleparam[:, :2].T
+                localpoleparam_xy_local = np.vstack([
+                    localpoleparam_xy_local, 
+                    np.zeros_like(localpoleparam_xy_local[0]), 
+                    np.ones_like(localpoleparam_xy_local[0])
+                ])
+                T_w_r = session.T_w_r_gt_velo[imid[iimap]]
+                localpoleparam_xy_global = np.matmul(T_w_r, localpoleparam_xy_local)
+                localpoleparam_global = localpoleparam.copy()
+                localpoleparam_global[:, :2] = localpoleparam_xy_global[:2, :].T
 
+                all_raw_poles_list.append(localpoleparam_global)
+                all_raw_descs_list.append(desc)
+
+                # ... (local clustering is the same) ...
+                xy = localpoleparam_global[:, :2]
+                a = localpoleparam_global[:, [2]]
+                boxes = np.hstack([xy - a, xy + a])
+                
+                for ci in cluster.cluster_boxes(boxes):
+                    ci = list(ci)
+                    if not ci:
+                        continue
+                    
+                    session_features_detected += 1
+                    
+                    local_cluster_poles = localpoleparam_global[ci, :]
+                    local_cluster_descs = desc[ci, :]
+                    
+                    merged_poles, merged_descs = merge_cluster_descriptors(
+                        local_cluster_poles,
+                        local_cluster_descs,
+                        threshold=0.2
+                    )
+                    
+                    if merged_poles.shape[0] == 0:
+                        continue
+                        
+                    new_pole = np.average(merged_poles, axis=0)
+                    new_desc = np.average(merged_descs, axis=0)
+                    
+                    # --- Match against Global Map using YOUR improved Logic ---
+                    match_idx = _score_based_feature_match(
+                        new_pole, new_desc,
+                        global_clustermeans, global_clusterdescs,
+                        POS_MATCH_THRESHOLD_METERS,
+                        DESC_MIN_SCORE_THRESHOLD,
+                        DESC_SCORE_TOLERANCE
+                    )
+                    
+                    if match_idx == -1:
+                        # This is a NEW feature (no match found)
+                        session_features_added += 1
+                        global_clustermeans = np.vstack([global_clustermeans, new_pole])
+                        global_clusterdescs = np.vstack([global_clusterdescs, new_desc])
+                        
+                        current_pos = session.T_w_r_gt_velo[imid[iimap], :2, 3]
+                        session_mappos_contributed.append(current_pos)
+                    # else:
+                        # This is a DUPLICATE (match_idx >= 0), do nothing.
+                
                 bar.update(iimap)
+        
+        # ... (calculating mapfactor is the same) ...
+        if session_features_detected > 0:
+            mapfactors[isession] = np.true_divide(session_features_added, session_features_detected)
+        else:
+            mapfactors[isession] = 0.0
+            
+        if session_mappos_contributed:
+            global_mappos = np.vstack([
+                global_mappos, 
+                np.unique(np.array(session_mappos_contributed), axis=0)
+            ])
 
-    xy = poleparams[:, :2]
-    a = poleparams[:, [2]]
-    boxes = np.hstack([xy - a, xy + a])
-    clustermeans = np.empty([0, 3])
-    clusterdescs = np.empty((0,64))
-    descs_array = np.vstack(all_descs)
-    print(poleparams.shape, descs_array.shape)
-    
-    desc_txt_path = os.path.join(session.dir, 'cluster_descriptors.txt')
-    cid = 0
-    with open(desc_txt_path, 'w') as f_desc:
-    
-        for ci in cluster.cluster_boxes(boxes):
-            ci = list(ci)
-            if len(ci) < n_mapdetections:
-                continue
-            
-            # build my mean pole and descriptor
-            local_poleparams = poleparams[ci, :]      # (Nc, 3)
-            local_descs = descs_array[ci, :]
-            
-            cluster_means, cluster_descs = merge_cluster_descriptors(
-                local_poleparams,
-                local_descs,
-                threshold=0.2
-            )
-            clustermeans = np.vstack([clustermeans, cluster_means])
-            clusterdescs = np.vstack([clusterdescs, cluster_descs])
-            
-            # clustermeans = np.vstack([clustermeans, np.average(poleparams[ci, :], axis=0)])
-            # cluster_descs = np.vstack([cluster_descs, np.mean(descs_array[ci, :], axis=0)])
-            
-            f_desc.write(f"c{cid}\n")
-            for i in range(len(cluster_descs)):
-                vec = cluster_descs[i]
-                line = " ".join(f"{v:.2f}" for v in vec)
-                f_desc.write(line + "\n")
+    # ... (final cleanup and np.savez are the same) ...
+    if all_raw_poles_list:
+        all_raw_poles_for_npz = np.vstack(all_raw_poles_list)
+        all_raw_descs_for_npz = np.vstack(all_raw_descs_list)
+    else:
+        all_raw_poles_for_npz = np.empty([0, 3])
+        all_raw_descs_for_npz = np.empty((0, 64))
 
-            cid += 1
+    if global_mappos.shape[0] > 0:
+        global_mappos = np.unique(global_mappos, axis=0)
         
     globalmapfile = os.path.join('nclt', get_globalmapname() + '.npz')
-    allglobalmapfile = os.path.join('nclt', get_globalmapname() + '_all' + '.npz')
-    if use_desc:
-        all_descs = np.vstack(all_descs)
-        np.savez(globalmapfile,
-                 polemeans=clustermeans,
-                 descmeans=clusterdescs,
-                 mapfactors=mapfactors,
-                 mappos=globalmappos,
-                 allpole=poleparams,
-                 descriptors=descs_array)
+    
+    np.savez(globalmapfile,
+             polemeans=global_clustermeans,
+             descmeans=global_clusterdescs,
+             mapfactors=mapfactors,
+             mappos=global_mappos,
+             allpole=all_raw_poles_for_npz,
+             descriptors=all_raw_descs_for_npz)
+    
+    print(f"--- Incremental Map Build Complete (Position-First) ---")
+    print(f"allpole.shape (raw): {all_raw_poles_for_npz.shape}, descriptors.shape (raw): {all_raw_descs_for_npz.shape}")
+    print(f"polemeans.shape (map): {global_clustermeans.shape}, descmeans.shape (map): {global_clusterdescs.shape}")
         
-        # np.savez(allglobalmapfile, polemeans=xy, descriptors=descs_array)
-        print(f"allpole.shape: {poleparams.shape}, descriptors.shape: {descs_array.shape}")
-        print(f"polemeans.shape: {clustermeans.shape}, descmeans.shape: {clusterdescs.shape}")
-        
-    else:
-        np.savez(globalmapfile,
-                 polemeans=clustermeans,
-                 mapfactors=mapfactors,
-                 mappos=globalmappos)
     plot_global_map(globalmapfile)
 
 
@@ -289,7 +492,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     # construct the descmap index
     desc_source = qmap if quant else descmap                    # shape (N,64) uint8
     map_ids = np.arange(desc_source.shape[0], dtype=np.int64)
-    #ivf = KMeansIVF()
+    # ivf = KMeansIVF()
     ivf = ZeroAwareIVF()
     # read ivf argument   
     if ivf_nlist is not None:
@@ -394,7 +597,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                     })
                     append_count += 1
                     
-                    if len(iactive) >= 2:
+                    if len(iactive) >= 4:
                         n_active_per_step[i] = len(iactive)
                         t_mid = session.t_velo[locdata[imap]['imid']]
                         T_w_r_mid = util.project_xy(session.get_T_w_r_odo(
@@ -1276,6 +1479,131 @@ def report_pole_detect_timing_for_sessions(
             f"[detect-report] session={sess}  N={n}  mean={mean_v:.2f}ms  median={med_v:.2f}ms  "
             f"std={std_v:.2f}ms  min={min_v:.2f}ms  max={max_v:.2f}ms (map_idx={max_idx_orig})  {pcts_str}"
         )
+        
+def analyze_path_revisits(target_sessions, distance_threshold):
+    """
+    Performs a "revisit analysis" for target sessions.
+
+    For each segment in a target session, it finds the MOST RECENT
+    previous session that has a segment within the distance_threshold.
+    It then plots a histogram of these most recent matches.
+    
+    [MODIFIED: Y-axis is now Percentage]
+    """
+    print("--- Starting Path Revisit Analysis ---")
+    
+    # 1. Pre-computation: Cache all segment positions for all sessions
+    print("Caching all session segment positions...")
+    all_positions_cache = {}
+    all_sorted_dates = pynclt.sessions 
+    
+    with progressbar.ProgressBar(max_value=len(all_sorted_dates)) as bar:
+        for i, date_str in enumerate(all_sorted_dates):
+            session = pynclt.session(date_str)
+            _, imid, _ = get_map_indices(session)
+            positions = session.T_w_r_gt_velo[imid, :2, 3]
+            all_positions_cache[date_str] = positions
+            bar.update(i)
+            
+    print("Cache built.")
+
+    # 2. Iterate through each target session for analysis
+    for target_date_str in target_sessions:
+        if target_date_str not in all_positions_cache:
+            print(f"Warning: Target session {target_date_str} not found in pynclt.sessions. Skipping.")
+            continue
+            
+        print(f"\nAnalyzing session: {target_date_str}")
+        
+        current_positions = all_positions_cache[target_date_str]
+        total_segments = len(current_positions)
+        
+        if total_segments == 0:
+            print(f"Session {target_date_str} has 0 segments. Skipping.")
+            continue
+
+        try:
+            target_date_index = all_sorted_dates.index(target_date_str)
+            previous_dates = all_sorted_dates[:target_date_index]
+        except ValueError:
+            print(f"Error finding {target_date_str} in sorted list. Skipping.")
+            continue
+            
+        assignments = [] 
+
+        # 3. Iterate through each segment
+        with progressbar.ProgressBar(max_value=total_segments) as bar:
+            for i, p_current in enumerate(current_positions):
+                most_recent_match = None
+                
+                # 4. Iterate through previous dates
+                for prev_date_str in previous_dates:
+                    prev_positions = all_positions_cache[prev_date_str]
+                    dists = np.linalg.norm(prev_positions - p_current, axis=1)
+                    if np.any(dists < distance_threshold):
+                        most_recent_match = prev_date_str
+                        
+                # 5. Assign the result
+                if most_recent_match:
+                    assignments.append(most_recent_match)
+                else:
+                    assignments.append('New')
+                
+                bar.update(i)
+
+        # 6. Plot the histogram (with percentages)
+        print(f"Plotting results for {target_date_str}...")
+        
+        counts_map = collections.Counter(assignments)
+        
+        labels = []
+        counts = []
+        
+        if 'New' in counts_map:
+            labels.append('New')
+            counts.append(counts_map['New'])
+            
+        for date in previous_dates:
+            if counts_map[date] > 0:
+                labels.append(date)
+                counts.append(counts_map[date])
+
+        if not labels:
+            print("No segments analyzed or no matches found.")
+            continue
+            
+        # --- MODIFICATION: Convert counts to percentages ---
+        percentages = (np.array(counts) / total_segments) * 100.0
+        # --- END MODIFICATION ---
+            
+        # Plotting
+        plt.figure(figsize=(15, 8))
+        bars = plt.bar(labels, percentages) # Use percentages
+        plt.title(f'Path Revisit Analysis for {target_date_str}\n(Total Segments: {total_segments}, Threshold: {distance_threshold}m)',
+                  fontsize=16)
+        plt.xlabel('Date of Most Recent Visit', fontsize=12)
+        plt.ylabel('Percentage of Segments (%)', fontsize=12) # Modified Y-axis label
+        plt.xticks(rotation=60, ha='right')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.ylim(0, 100) # Y-axis is 0 to 100%
+
+        # Add percentage text on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2.0, height + 1.0, 
+                         f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
+
+        plt.tight_layout()
+        
+        # Save the figure
+        figname = f'revisit_analysis_{target_date_str}_percent.png' # Changed filename
+        plt.savefig(figname)
+        plt.close()
+        print(f"Saved histogram to {figname}")
+
+    print("--- Revisit Analysis Complete ---")
+    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -1306,6 +1634,8 @@ if __name__ == '__main__':
 
     #plot_trajectories()
     evaluate()
+    
+    #analyze_path_revisits(pynclt.sessions, 10)
     
     plot_timing_stacked_for_sessions(pynclt.sessions, base_dir="nclt")
     report_max_timing_for_sessions(pynclt.sessions, base_dir="nclt")
