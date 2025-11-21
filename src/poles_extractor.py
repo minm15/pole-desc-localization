@@ -3,7 +3,7 @@ from numba import jit
 import torch
 
 
-def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_point_num=3, width_thr=10, fov_up=30.67, fov_down=-10.67, proj_H=32, proj_W=256, lowest=0.1, highest=6, lowthr=1.5, highthr=0.7, totalthr=0.6):
+def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_point_num=3, width_thr=10, fov_up=30.67, fov_down=-10.67, proj_H=32, proj_W=256, lowest=0.1, highest=6, lowthr=1.5, highthr=0.7, totalthr=0.6, vis=False, desc=False):
     range_data_raw, proj_vertex, _ = range_projection(xyz,
                                                   fov_up=fov_up,
                                                   fov_down=fov_down,
@@ -18,6 +18,10 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
     width = range_data_raw.shape[1]
 
     poleparams = np.empty([0, 3])
+    
+    # Visualization initialization
+    if vis:
+        pole_vis = np.full((proj_H, proj_W), 0, dtype=np.int)
 
     range_data = norm_range(range_data_raw)
 
@@ -31,9 +35,8 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
     open_set = gen_open_set(pole_out, height, width)
     open_set = np.array(open_set)
 
-    if open_set.shape[0] == 0:
-        return poleparams
-    else:
+    # 若 open_set 為空，直接跳到底部的 return 邏輯 (確保 desc/vis 格式正確)
+    if open_set.shape[0] != 0:
         clusters = gen_clusters_learning(open_set, pole_out, height,
                                          width, range_data_raw, min_point_num=min_point_num)
         
@@ -91,12 +94,27 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
                                 neighbour = xyz[(((scan_x > (average_x - fine_thr - neighbourthr)) & (scan_x < (average_x - fine_thr))) | ((scan_x > (average_x + fine_thr)) & (scan_x < (average_x + fine_thr + neighbourthr)))) & (
                                     ((scan_y > (average_y + fine_thr - neighbourthr)) & (scan_y < (average_y - fine_thr))) | ((scan_y > (average_y + fine_thr)) & (scan_y < (average_y + fine_thr + neighbourthr)))) & (scan_z < high) & (scan_z > low)]
                                 if neighbour.shape[0] < 0.15 * current_vertex_fine.shape[0]:
-                                    # for index in cluster:
-                                    #     range_data_copy[index[0]][index[1]] = 1
+                                    # Update visualization mask if enabled
+                                    if vis:
+                                        for index in cluster:
+                                            pole_vis[index[0]][index[1]] = 1
+                                    
                                     poleparams = np.vstack(
                                         [poleparams, [xc_1, yc_1, R_1]])
 
-        return poleparams
+    # Return logic based on desc and vis flags
+    if desc:
+        keypoints = poleparams[:, :2]
+        descriptors = compute_link3d_descriptor(keypoints)
+        if vis:
+            return poleparams, pole_vis, descriptors
+        else:
+            return poleparams, descriptors
+    else:
+        if vis:
+            return poleparams, pole_vis
+        else:
+            return poleparams
 
 # xyz, neighbourthr = 0.5, min_point_num = 2, dis_thr = 0.08, width_thr = 20, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.2, highthr = 0.5, totalthr = 0.4, vis=False, desc=False
 def detect_poles(xyz, neighbourthr = 0.5, min_point_num = 3, dis_thr = 0.08, width_thr = 10, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.5, highthr = 0.7, totalthr = 0.6, vis=False, desc=False):
