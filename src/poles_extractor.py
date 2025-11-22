@@ -35,7 +35,6 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
     open_set = gen_open_set(pole_out, height, width)
     open_set = np.array(open_set)
 
-    # 若 open_set 為空，直接跳到底部的 return 邏輯 (確保 desc/vis 格式正確)
     if open_set.shape[0] != 0:
         clusters = gen_clusters_learning(open_set, pole_out, height,
                                          width, range_data_raw, min_point_num=min_point_num)

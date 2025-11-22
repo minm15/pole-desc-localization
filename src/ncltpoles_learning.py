@@ -218,10 +218,31 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
     istart, imid, iend = get_map_indices(session)
     maps = []
     all_descs = []
-    tim_detect_ms = []
-    ts_localmaps = []
+    
+    detection_times_ms = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    def plot_timing_analysis(times, save_dir):
+        plt.figure(figsize=(10, 6))
+        plt.plot(times, linestyle='-', color='b', linewidth=1, alpha=0.8)
+        plt.title(f"Detection Latency Analysis ({sessionname})")
+        plt.xlabel("Frame Sequence Index")
+        plt.ylabel("Inference Time (ms)")
+        plt.grid(True, linestyle='--', alpha=0.6)
+        
+        avg_time = np.mean(times)
+        plt.axhline(y=avg_time, color='r', linestyle='--', label=f'Avg: {avg_time:.2f} ms')
+        plt.legend()
+
+        output_path = os.path.join(save_dir, "detection_timing.png")
+        plt.savefig(output_path)
+        plt.close() 
+        print(f"Timing plot saved to: {output_path}")
+
     with progressbar.ProgressBar(max_value=len(iend)) as bar:
         for i in range(len(iend)):
+            # Pre-processing
             T_w_mc = util.project_xy(session.T_w_r_odo_velo[imid[i]].dot(T_r_mc))
             T_w_m = T_w_mc.dot(T_mc_m)
             T_m_w = util.invert_ht(T_w_m)
@@ -233,7 +254,8 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             iscan = imid[i]
             xyz, _ = session.get_velo(iscan)
             
-            t0 = time.perf_counter_ns()
+            start_event.record()
+            
             if use_desc:
                 poleparams, desc = poles_extractor.detect_poles_learning(
                     xyz, model, device, cut_z=False, desc=True, vis=False)
@@ -241,9 +263,13 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             else:
                 poleparams = poles_extractor.detect_poles_learning(
                     xyz, model, device, cut_z=False, desc=False, vis=False)
-                
-            tim_detect_ms.append((time.perf_counter_ns() - t0) / 1e6)
-            ts_localmaps.append(session.t_velo[imid[i]])
+            
+            end_event.record()
+            torch.cuda.synchronize() 
+            
+            elapsed_ms = start_event.elapsed_time(end_event)
+            if elapsed_ms < 300: detection_times_ms.append(elapsed_ms)
+            # ---------------------------
 
             localpoleparam_xy = poleparams[:, :2]
             localpoleparam_xy = localpoleparam_xy.T
@@ -258,9 +284,10 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             maps.append(map)
             bar.update(i)
             
-    np.savez(os.path.join(session.dir, get_localmapfile()), maps=maps,
-             tim_detect_ms=np.array(tim_detect_ms, dtype=np.float32),
-             ts_localmaps=np.asarray(ts_localmaps, dtype=np.float64))
+    if detection_times_ms:
+        plot_timing_analysis(detection_times_ms, session.dir)
+    
+    np.savez(os.path.join(session.dir, get_localmapfile()), maps=maps)
 
 def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nlist=None, ivf_nprobe=None):
     print(sessionname)
@@ -513,13 +540,13 @@ if __name__ == '__main__':
     
     #save_global_map(use_desc=True)
     for session in pynclt.sessions[args.session_start:args.session_end]:
-        #save_local_maps(session, use_desc=True)
-        localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        save_local_maps(session, use_desc=True)
+        #localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
 
     evaluate()
     
     # [Refactor] Use report_utils
-    # report_utils.plot_timing_stacked_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
-    # report_utils.report_max_timing_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
-    # report_utils.plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
-    # report_utils.report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")
+    report_utils.plot_timing_stacked_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
+    report_utils.report_max_timing_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
+    report_utils.plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
+    report_utils.report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")
