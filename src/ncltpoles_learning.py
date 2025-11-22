@@ -97,14 +97,109 @@ def get_map_indices(session):
             iend.append(id); k += 1
     return istart[:len(iend)], imid[:len(iend)], iend
 
+def save_global_map_position(use_desc=False):
+    globalmappos = np.empty([0, 2])
+    mapfactors = np.full(len(pynclt.sessions), np.nan)
+    poleparams = np.empty([0, 3])
+    all_descs = []
+    for isession, s in enumerate(pynclt.sessions):
+        print(s)
+        session = pynclt.session(s)
+        istart, imid, iend = get_map_indices(session)
+        localmappos = session.T_w_r_gt_velo[imid, :2, 3]
+        if globalmappos.size == 0:
+            imaps = range(localmappos.shape[0])
+        else:
+            imaps = []
+            for imap in range(localmappos.shape[0]):
+                distance = np.linalg.norm(
+                    localmappos[imap] - globalmappos, axis=1).min()
+                if distance > remapdistance:
+                    imaps.append(imap)
+        globalmappos = np.vstack([globalmappos, localmappos[imaps]])
+        mapfactors[isession] = np.true_divide(len(imaps), len(imid))
+
+        with progressbar.ProgressBar(max_value=len(imaps)) as bar:
+            for iimap, imap in enumerate(imaps):
+                iscan = imid[imap]
+                xyz, _ = session.get_velo(iscan)
+                
+                if use_desc:
+                    # Learning-based Detection
+                    localpoleparam, desc = poles_extractor.detect_poles_learning(
+                        xyz, model, device, cut_z=False, desc=True, vis=False)
+                    # if len(desc) < 4: continue 
+                    all_descs.append(desc)
+                else:
+                    localpoleparam = poles_extractor.detect_poles(xyz)
+
+                # localpoleparam = poles_extractor.detect_poles(xyz)
+                localpoleparam_xy = localpoleparam[:, :2]
+                localpoleparam_xy = localpoleparam_xy.T
+                localpoleparam_xy = np.vstack([localpoleparam_xy, np.zeros_like(localpoleparam_xy[0]), np.ones_like(localpoleparam_xy[0])]) #4*n
+                localpoleparam_xy = np.matmul(session.T_w_r_gt_velo[imid[imap]], localpoleparam_xy)
+                localpoleparam[:, :2] = localpoleparam_xy[:2,:].T
+                poleparams = np.vstack([poleparams, localpoleparam])
+
+                bar.update(iimap)
+
+    xy = poleparams[:, :2]
+    a = poleparams[:, [2]]
+    boxes = np.hstack([xy - a, xy + a])
+    clustermeans = np.empty([0, 3])
+    clusterdescs = np.empty((0,64))
+    descs_array = np.vstack(all_descs)
+    print(poleparams.shape, descs_array.shape)
+    
+    for ci in cluster.cluster_boxes(boxes):
+        ci = list(ci)
+        if len(ci) < n_mapdetections:
+            continue
+        
+        # build my mean pole and descriptor
+        local_poleparams = poleparams[ci, :]      # (Nc, 3)
+        local_descs = descs_array[ci, :]
+        
+        cluster_means, cluster_descs = feature_utils.merge_cluster_descriptors(
+            local_poleparams,
+            local_descs,
+            threshold=0.2
+        )
+        clustermeans = np.vstack([clustermeans, cluster_means])
+        clusterdescs = np.vstack([clusterdescs, cluster_descs])
+
+        
+    globalmapfile = os.path.join('nclt', get_globalmapname() + '.npz')
+    allglobalmapfile = os.path.join('nclt', get_globalmapname() + '_all' + '.npz')
+    if use_desc:
+        all_descs = np.vstack(all_descs)
+        np.savez(globalmapfile,
+                 polemeans=clustermeans,
+                 descmeans=clusterdescs,
+                 mapfactors=mapfactors,
+                 mappos=globalmappos,
+                 allpole=poleparams,
+                 descriptors=descs_array)
+        
+        # np.savez(allglobalmapfile, polemeans=xy, descriptors=descs_array)
+        print(f"allpole.shape: {poleparams.shape}, descriptors.shape: {descs_array.shape}")
+        print(f"polemeans.shape: {clustermeans.shape}, descmeans.shape: {clusterdescs.shape}")
+        
+    else:
+        np.savez(globalmapfile,
+                 polemeans=clustermeans,
+                 mapfactors=mapfactors,
+                 mappos=globalmappos)
+    report_utils.plot_global_map(globalmapfile)
+
 
 def save_global_map(use_desc=False):
     if not use_desc:
         raise ValueError("The incremental save_global_map logic requires use_desc=True")
 
-    POS_MATCH_THRESHOLD_METERS = 10.0
+    POS_MATCH_THRESHOLD_METERS = 8.0
     DESC_SCORE_TOLERANCE = 0.2
-    DESC_MIN_SCORE_THRESHOLD = 2
+    DESC_MIN_SCORE_THRESHOLD = 3
 
     global_clustermeans = np.empty([0, 3])
     global_clusterdescs = np.empty((0, 64))
@@ -538,6 +633,7 @@ if __name__ == '__main__':
     ivf_nlist = args.nlist
     ivf_nprobe = args.nprobe
     
+    #save_global_map_position(use_desc=True)
     #save_global_map(use_desc=True)
     for session in pynclt.sessions[args.session_start:args.session_end]:
         save_local_maps(session, use_desc=True)
