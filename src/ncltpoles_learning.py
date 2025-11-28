@@ -596,7 +596,7 @@ def evaluate(output_path=args.eval_out):
     else:
         out = open(output_path, 'a')
         close_out = True
-    print('session \t f\te_pos \trmse_pos \te_ang \te_rmse')
+    print('session \t f\te_pos \trmse_pos \te_ang \te_rmse', file=out)
     row = '{session} \t{f} \t{poserror} \t{posrmse} \t{angerror} \t{angrmse}'
     for i, stat in enumerate(stats):
         print(row.format(
@@ -605,7 +605,8 @@ def evaluate(output_path=args.eval_out):
             poserror=stat['poserror'],
             posrmse=stat['posrmse'],
             angerror=stat['angerror'],
-            angrmse=stat['angrmse']))
+            angrmse=stat['angrmse']),
+            file=out)
         
     if close_out:
         out.close()
@@ -631,7 +632,7 @@ if __name__ == '__main__':
     evaluate(output_path=args.eval_out)
     
     # [Refactor] Use report_utils
-    report_utils.plot_timing_stacked_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
-    report_utils.report_max_timing_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
-    report_utils.plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
-    report_utils.report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")
+    # report_utils.plot_timing_stacked_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
+    # report_utils.report_max_timing_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
+    # report_utils.plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
+    # report_utils.report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")

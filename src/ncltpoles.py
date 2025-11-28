@@ -591,7 +591,7 @@ def evaluate(output_path=None):
     else:
         out = open(output_path, 'a')
         close_out = True
-    print('session \t f\te_pos \trmse_pos \te_ang \te_rmse')
+    print('session \t f\te_pos \trmse_pos \te_ang \te_rmse', file=out)
     row = '{session} \t{f} \t{poserror} \t{posrmse} \t{angerror} \t{angrmse}'
     for i, stat in enumerate(stats):
         print(row.format(
@@ -600,7 +600,8 @@ def evaluate(output_path=None):
             poserror=stat['poserror'],
             posrmse=stat['posrmse'],
             angerror=stat['angerror'],
-            angrmse=stat['angrmse']))
+            angrmse=stat['angrmse']),
+            file=out)
         
     if close_out:
         out.close()
