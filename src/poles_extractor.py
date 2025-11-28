@@ -3,7 +3,7 @@ from numba import jit
 import torch
 
 
-def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_point_num=3, width_thr=10, fov_up=30.67, fov_down=-10.67, proj_H=32, proj_W=256, lowest=0.1, highest=6, lowthr=1.5, highthr=0.7, totalthr=0.6, vis=False, desc=False):
+def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_point_num=3, width_thr=10, fov_up=30.67, fov_down=-10.67, proj_H=32, proj_W=256, lowest=0.1, highest=6, lowthr=1.5, highthr=0.7, totalthr=0.6, desc_dim = 64, vis=False, desc=False):
     range_data_raw, proj_vertex, _ = range_projection(xyz,
                                                   fov_up=fov_up,
                                                   fov_down=fov_down,
@@ -35,7 +35,6 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
     open_set = gen_open_set(pole_out, height, width)
     open_set = np.array(open_set)
 
-    # 若 open_set 為空，直接跳到底部的 return 邏輯 (確保 desc/vis 格式正確)
     if open_set.shape[0] != 0:
         clusters = gen_clusters_learning(open_set, pole_out, height,
                                          width, range_data_raw, min_point_num=min_point_num)
@@ -105,7 +104,7 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
     # Return logic based on desc and vis flags
     if desc:
         keypoints = poleparams[:, :2]
-        descriptors = compute_link3d_descriptor(keypoints)
+        descriptors = compute_link3d_descriptor(keypoints, desc_dim)
         if vis:
             return poleparams, pole_vis, descriptors
         else:
@@ -117,7 +116,7 @@ def detect_poles_learning(xyz, model, device, cut_z=True, neighbourthr=0.5, min_
             return poleparams
 
 # xyz, neighbourthr = 0.5, min_point_num = 2, dis_thr = 0.08, width_thr = 20, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.2, highthr = 0.5, totalthr = 0.4, vis=False, desc=False
-def detect_poles(xyz, neighbourthr = 0.5, min_point_num = 3, dis_thr = 0.08, width_thr = 10, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.5, highthr = 0.7, totalthr = 0.6, vis=False, desc=False):
+def detect_poles(xyz, neighbourthr = 0.5, min_point_num = 3, dis_thr = 0.08, width_thr = 10, fov_up=30.67, fov_down=-10.67, proj_H = 32, proj_W = 250, lowest=0.1, highest=6, lowthr = 1.5, highthr = 0.7, totalthr = 0.6, desc_dim = 64, vis=False, desc=False):
     range_data, proj_vertex, _ = range_projection(xyz,
                                                 fov_up=fov_up,
                                                 fov_down=fov_down,
@@ -206,15 +205,10 @@ def detect_poles(xyz, neighbourthr = 0.5, min_point_num = 3, dis_thr = 0.08, wid
                                     for index in cluster:
                                         pole_vis[index[0]][index[1]] = 1
                                 poleparams = np.vstack([poleparams, [xc_1,yc_1,R_1]])
-
-    # if vis:
-    #     return poleparams, pole_vis
-    # else:
-    #     return poleparams
     
     if desc:
         keypoints = poleparams[:, :2]
-        descriptors = compute_link3d_descriptor(keypoints)
+        descriptors = compute_link3d_descriptor(keypoints, desc_dim)
         if vis:
             return poleparams, pole_vis, descriptors
         else:
@@ -438,13 +432,13 @@ def fit_circle(x, y):
 
     return None
 
-def compute_link3d_descriptor(keypoints):
+def compute_link3d_descriptor(keypoints, desc_dim):
     """
     keypoints: np.ndarray of shape (N, 2) -> (x, y)
     return descriptors: np.ndarray of shape (N, D)
     """
     N = keypoints.shape[0]
-    D = 64
+    D = desc_dim
     descriptors = np.zeros((N, D), dtype=np.float32)
     if N < 4:
         return descriptors

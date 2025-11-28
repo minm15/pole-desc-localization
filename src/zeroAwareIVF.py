@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
+desc_dim = 62
+
 
 # -------- helpers (same semantics as your original) --------
 def _to_presence_bits(descs: np.ndarray) -> np.ndarray:
@@ -13,7 +15,7 @@ def _to_presence_bits(descs: np.ndarray) -> np.ndarray:
     Return binary presence bits for (N,64) uint8 descriptors:
     1 if dim is non-zero, else 0.
     """
-    assert descs.ndim == 2 and descs.shape[1] == 64, "Expect (N,64)"
+    assert descs.ndim == 2 and descs.shape[1] == desc_dim, "Expect (N,64)"
     return (descs != 0).astype(np.uint8)
 
 
@@ -49,9 +51,9 @@ def _nonzero_unitvar_scale(X: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     Returns:
         (64,) float32 array of per-dimension scales
     """
-    assert X.ndim == 2 and X.shape[1] == 64
-    stds = np.zeros(64, dtype=np.float32)
-    for d in range(64):
+    assert X.ndim == 2 and X.shape[1] == desc_dim
+    stds = np.zeros(desc_dim, dtype=np.float32)
+    for d in range(desc_dim):
         col = X[:, d]
         nz = col[col != 0]
         if nz.size > 1:
@@ -185,7 +187,7 @@ class ZeroAwareIVF:
         Returns:
             dict with basic build statistics.
         """
-        assert map_descs.ndim == 2 and map_descs.shape[1] == 64, "map_descs must be (N,64)"
+        assert map_descs.ndim == 2 and map_descs.shape[1] == desc_dim, "map_descs must be (N,64)"
         self._map_descs = map_descs
         N = map_descs.shape[0]
 
@@ -214,7 +216,7 @@ class ZeroAwareIVF:
         if self.use_idf:
             self._idf_w = _idf_weights(Z.astype(np.uint8))     # (64,)
         else:
-            self._idf_w = np.ones(64, dtype=np.float32)
+            self._idf_w = np.ones(desc_dim, dtype=np.float32)
 
         Wv = (self.alpha_value * self._idf_w)[None, :]         # (1,64)
         Wz = (self.beta_presence * self._idf_w)[None, :]       # (1,64)
@@ -288,7 +290,7 @@ class ZeroAwareIVF:
         Returns:
             List[int] of candidate map_ids (deduped if requested)
         """
-        assert q_desc.ndim == 1 and q_desc.shape[0] == 64 and q_desc.dtype == np.uint8, \
+        assert q_desc.ndim == 1 and q_desc.shape[0] == desc_dim and q_desc.dtype == np.uint8, \
             "q_desc must be (64,) uint8"
         assert self._aug_centroids is not None and self._val_scale is not None and self._idf_w is not None
 
@@ -382,7 +384,7 @@ class ZeroAwareIVF:
         """
         if self._aug_centroids is None:
             return None
-        pres = self._aug_centroids[:, 64:]  # (K,64)
+        pres = self._aug_centroids[:, desc_dim:]  # (K,64)
         return (pres > 0).astype(np.uint8)
 
     def assigned_list_ids(self) -> Optional[np.ndarray]:

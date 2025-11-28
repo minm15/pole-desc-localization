@@ -1,5 +1,6 @@
 import datetime
 import os
+import sys
 import matplotlib.pyplot as plt
 import numpy as np
 import progressbar
@@ -29,6 +30,7 @@ remapdistance = 10.0
 n_mapdetections = 6
 n_locdetections = 2
 n_localmaps = 6
+desc_dim = 64
 
 T_mc_r = pynclt.T_w_o
 T_r_mc = util.invert_ht(T_mc_r)
@@ -72,14 +74,104 @@ def get_map_indices(session):
             iend.append(id); k += 1
     return istart[:len(iend)], imid[:len(iend)], iend
 
-def save_global_map(use_desc=False):
+def save_global_map_position():
+    globalmappos = np.empty([0, 2])
+    mapfactors = np.full(len(pynclt.sessions), np.nan)
+    poleparams = np.empty([0, 3])
+    all_descs = []
+    for isession, s in enumerate(pynclt.sessions):
+        print(s)
+        session = pynclt.session(s)
+        istart, imid, iend = get_map_indices(session)
+        localmappos = session.T_w_r_gt_velo[imid, :2, 3]
+        if globalmappos.size == 0:
+            imaps = range(localmappos.shape[0])
+        else:
+            imaps = []
+            for imap in range(localmappos.shape[0]):
+                distance = np.linalg.norm(
+                    localmappos[imap] - globalmappos, axis=1
+                ).min()
+                if distance > remapdistance:
+                    imaps.append(imap)
+        globalmappos = np.vstack([globalmappos, localmappos[imaps]])
+        mapfactors[isession] = np.true_divide(len(imaps), len(imid)) if len(imid) > 0 else 0.0
+
+        with progressbar.ProgressBar(max_value=len(imaps)) as bar:
+            for iimap, imap in enumerate(imaps):
+                iscan = imid[imap]
+                xyz, _ = session.get_velo(iscan)
+
+                localpoleparam, desc = poles_extractor.detect_poles(
+                    xyz, desc_dim=desc_dim, desc=True
+                )
+                if localpoleparam.shape[0] == 0:
+                    bar.update(iimap)
+                    continue
+
+                all_descs.append(desc)
+
+                localpoleparam_xy = localpoleparam[:, :2].T
+                localpoleparam_xy = np.vstack([
+                    localpoleparam_xy,
+                    np.zeros_like(localpoleparam_xy[0]),
+                    np.ones_like(localpoleparam_xy[0])
+                ])
+                T_w_r = session.T_w_r_gt_velo[imid[imap]]
+                localpoleparam_xy_global = np.matmul(T_w_r, localpoleparam_xy)
+                localpoleparam[:, :2] = localpoleparam_xy_global[:2, :].T
+
+                poleparams = np.vstack([poleparams, localpoleparam])
+
+                bar.update(iimap)
+
+    xy = poleparams[:, :2]
+    a = poleparams[:, [2]]
+    boxes = np.hstack([xy - a, xy + a])
+    clustermeans = np.empty([0, 3])
+    clusterdescs = np.empty((0, desc_dim))
+    descs_array = np.vstack(all_descs)
+    print("poleparams.shape:", poleparams.shape, "descs_array.shape:", descs_array.shape)
+
+    for ci in cluster.cluster_boxes(boxes):
+        ci = list(ci)
+        if len(ci) < n_mapdetections:
+            continue
+
+        local_poleparams = poleparams[ci, :]      # (Nc, 3)
+        local_descs = descs_array[ci, :]          # (Nc, desc_dim)
+
+        cluster_means, cluster_descs = feature_utils.merge_cluster_descriptors(
+            local_poleparams,
+            local_descs,
+            threshold=0.2
+        )
+        clustermeans = np.vstack([clustermeans, cluster_means])
+        clusterdescs = np.vstack([clusterdescs, cluster_descs])
+
+    globalmapfile = os.path.join('nclt', get_globalmapname() + '.npz')
+
+    np.savez(
+        globalmapfile,
+        polemeans=clustermeans,
+        descmeans=clusterdescs,
+        mapfactors=mapfactors,
+        mappos=globalmappos,
+        allpole=poleparams,
+        descriptors=descs_array
+    )
+
+    print(f"allpole.shape: {poleparams.shape}, descriptors.shape: {descs_array.shape}")
+    print(f"polemeans.shape: {clustermeans.shape}, descmeans.shape: {clusterdescs.shape}")
+
+    report_utils.plot_global_map(globalmapfile)
+
+
+def save_global_map():
     """
     Incrementally builds the global feature map using position-first, 
     score-based matching.
     """
-    if not use_desc:
-        raise ValueError("The incremental save_global_map logic requires use_desc=True")
-
     # --- Thresholds ---
     POS_MATCH_THRESHOLD_METERS = 10.0
     DESC_SCORE_TOLERANCE = 0.2
@@ -87,7 +179,7 @@ def save_global_map(use_desc=False):
 
     # --- Variables ---
     global_clustermeans = np.empty([0, 3])
-    global_clusterdescs = np.empty((0, 64))
+    global_clusterdescs = np.empty((0, desc_dim))
     global_mappos = np.empty([0, 2])
     mapfactors = np.full(len(pynclt.sessions), np.nan)
     all_raw_poles_list = []
@@ -107,7 +199,7 @@ def save_global_map(use_desc=False):
                 iscan = imid[iimap]
                 xyz, _ = session.get_velo(iscan)
                 
-                localpoleparam, desc = poles_extractor.detect_poles(xyz, desc=True)
+                localpoleparam, desc = poles_extractor.detect_poles(xyz, desc_dim=desc_dim, desc=True)
                 
                 if localpoleparam.shape[0] == 0:
                     bar.update(iimap); continue
@@ -186,7 +278,7 @@ def save_global_map(use_desc=False):
         all_raw_descs_for_npz = np.vstack(all_raw_descs_list)
     else:
         all_raw_poles_for_npz = np.empty([0, 3])
-        all_raw_descs_for_npz = np.empty((0, 64))
+        all_raw_descs_for_npz = np.empty((0, desc_dim))
 
     if global_mappos.shape[0] > 0:
         global_mappos = np.unique(global_mappos, axis=0)
@@ -205,7 +297,7 @@ def save_global_map(use_desc=False):
     
     report_utils.plot_global_map(globalmapfile)
 
-def save_local_maps(sessionname, visualize=False, use_desc=False):
+def save_local_maps(sessionname, visualize=False):
     print(sessionname)
     session = pynclt.session(sessionname)
     util.makedirs(session.dir)
@@ -228,11 +320,8 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
             xyz, _ = session.get_velo(iscan)
             
             t0 = time.perf_counter_ns()
-            if use_desc:
-                poleparams, desc = poles_extractor.detect_poles(xyz, desc=True)
-                all_descs.append(desc)
-            else:
-                poleparams = poles_extractor.detect_poles(xyz)
+            poleparams, desc = poles_extractor.detect_poles(xyz, desc_dim=desc_dim, desc=True)
+            all_descs.append(desc)
             tim_detect_ms.append((time.perf_counter_ns() - t0) / 1e6)
             ts_localmaps.append(session.t_velo[imid[i]])
 
@@ -244,8 +333,7 @@ def save_local_maps(sessionname, visualize=False, use_desc=False):
 
             map = {'poleparams': poleparams, 'T_w_m': T_w_m, 'T_g_m': T_g_m,
                 'istart': istart[i], 'imid': imid[i], 'iend': iend[i]}
-            if use_desc:
-                map['descriptors'] = desc
+            map['descriptors'] = desc
             maps.append(map)
             bar.update(i)
             
@@ -304,7 +392,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     descmap_index, edges = ivf, None
     
     # Filters
-    filter = particlefilter.particlefilter(5000, 
+    filter = particlefilter.particlefilter(10000, 
         T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
@@ -314,11 +402,9 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     knn_filter.estimatetype = 'best'
     knn_filter.minneff = 0.5
 
-    # Visualization setup (Simplified)
     if visualize:
         plt.ion(); figure = plt.figure()
         mapaxes = figure.add_subplot(1, 1, 1)
-        # ... visualization details omitted for brevity, consistent with original ...
 
     imap = 0
     while imap < locdata.shape[0] - 1 and \
@@ -428,11 +514,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
             n_active_per_step=n_active_per_step,)
     print('append_count', append_count)
 
-def plot_trajectories():
-    # ... (Keep trajectory plotting if needed, or move to report_utils fully) ...
-    pass 
-
-def evaluate():
+def evaluate(output_path=None):
     stats = []
     for sessionname in pynclt.sessions:
         files = [file for file in os.listdir(os.path.join(pynclt.resultdir, sessionname)) if file.startswith(get_locfileprefix())]
@@ -503,6 +585,12 @@ def evaluate():
     np.savez(os.path.join(pynclt.resultdir, get_evalfile()), stats=stats)
     
     mapdata = np.load(os.path.join('nclt', get_globalmapname() + '.npz'))
+    if output_path is None:
+        out = sys.stdout
+        close_out = False
+    else:
+        out = open(output_path, 'a')
+        close_out = True
     print('session \t f\te_pos \trmse_pos \te_ang \te_rmse')
     row = '{session} \t{f} \t{poserror} \t{posrmse} \t{angerror} \t{angrmse}'
     for i, stat in enumerate(stats):
@@ -513,28 +601,33 @@ def evaluate():
             posrmse=stat['posrmse'],
             angerror=stat['angerror'],
             angrmse=stat['angrmse']))
+        
+    if close_out:
+        out.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--quant', nargs='?', const=6, type=int, help='Enable quant mode with specified bits (default: 6)')
     parser.add_argument('--nlist', type=int, default=None, help='FAISS IVF nlist')
     parser.add_argument('--nprobe', type=int, default=None, help='FAISS IVF nprobe')
+    parser.add_argument('--desc_dim', type=int, default=64, help='descriptor dimension (default: 64)')
+    parser.add_argument('--eval_out', type=str, default=None, help='path to save evaluation summary (default: stdout)')
     args = parser.parse_args()
     
     do_quant = args.quant is not None
     quant_bits = args.quant
+    desc_dim = args.desc_dim
         
     print(f"Quantization enabled? {do_quant}, bits={quant_bits}")
     ivf_nlist = args.nlist
     ivf_nprobe = args.nprobe
     
-    save_global_map(use_desc=True)
-    for session in pynclt.sessions:
-        save_local_maps(session, use_desc=True)
-        localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+    # save_global_map()
+    # for session in pynclt.sessions:
+    #     save_local_maps(session)
+    #     localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
 
-    evaluate()
+    evaluate(output_path=args.eval_out)
     
-
-    report_utils.plot_timing_stacked_for_sessions(pynclt.sessions, base_dir="nclt")
-    report_utils.report_max_timing_for_sessions(pynclt.sessions, base_dir="nclt")
+    # report_utils.plot_timing_stacked_for_sessions(pynclt.sessions, base_dir="nclt")
+    # report_utils.report_max_timing_for_sessions(pynclt.sessions, base_dir="nclt")

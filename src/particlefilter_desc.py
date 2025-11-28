@@ -38,7 +38,9 @@ class particlefilter:
         self.particles = np.matmul(self.particles, T_r0_r1)
 
     def update_measurement(self, desc, poleparams, resample=True):
-        matches = self.matcher_quant(desc) if self.quant else self.matcher(desc)
+        est_pose = self.estimate_pose()
+        matches = self.matcher_quant(desc, est_pose) if self.quant else self.matcher(desc, est_pose)
+        # matches = self.matcher_quant(desc) if self.quant else self.matcher(desc)
         M = poleparams.shape[0]
         polepos_r = np.hstack([poleparams[:, :2], np.zeros([M, 1]), np.ones([M, 1])]).T
         
@@ -134,25 +136,57 @@ class particlefilter:
         eq = (C == q[None, :])
         return (eq & nz).sum(axis=1)
     
-    def matcher(self, local_descs: np.ndarray):
-        """
-        IVF-only matcher for non-quantized descriptors.
-        For each local row, retrieve ALL candidates from the probed lists (no cap),
-        score with tolerance & non-zero, pick the best row index.
-        Returns: List[(i_local, j_global_row)]
-        """
+    # def matcher(self, local_descs: np.ndarray):
+    #     """
+    #     IVF-only matcher for non-quantized descriptors.
+    #     For each local row, retrieve ALL candidates from the probed lists (no cap),
+    #     score with tolerance & non-zero, pick the best row index.
+    #     Returns: List[(i_local, j_global_row)]
+    #     """
+    #     matches: list[tuple[int, int]] = []
+    #     ivf = self.descmap_index  # KMeansIVF object
+    #     for i, d1 in enumerate(local_descs):
+    #         # candidates_for_query with max_cands=None -> no cap; dedup=True is fine since map_id == row index
+    #         cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
+    #         if not cand_rows:
+    #             matches.append((i, -1))
+    #             continue
+    #         C = self.descmap[cand_rows]  # (K,64)
+    #         scores = self._score_tol_nonzero(d1, C, tol=0.2)
+    #         best_k = int(np.argmax(scores))
+    #         matches.append((i, int(cand_rows[best_k])))
+    #     return matches
+    
+    def matcher(self, local_descs: np.ndarray, current_pose_w: np.ndarray, search_radius: float = 20.0):
         matches: list[tuple[int, int]] = []
-        ivf = self.descmap_index  # KMeansIVF object
+        ivf = self.descmap_index
+        
+        rx, ry = current_pose_w[0, 3], current_pose_w[1, 3]
+        
         for i, d1 in enumerate(local_descs):
-            # candidates_for_query with max_cands=None -> no cap; dedup=True is fine since map_id == row index
             cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
             if not cand_rows:
                 matches.append((i, -1))
                 continue
-            C = self.descmap[cand_rows]  # (K,64)
+
+            cand_indices = np.array(cand_rows, dtype=int)
+            cand_pos = self.descxy[cand_indices, :2] # (N_cand, 2)
+            
+            dist_sq = (cand_pos[:, 0] - rx)**2 + (cand_pos[:, 1] - ry)**2
+            valid_mask = dist_sq < (search_radius ** 2)
+            
+            valid_cands = cand_indices[valid_mask]
+            
+            if len(valid_cands) == 0:
+                matches.append((i, -1))
+                continue
+                
+            C = self.descmap[valid_cands]
             scores = self._score_tol_nonzero(d1, C, tol=0.2)
-            best_k = int(np.argmax(scores))
-            matches.append((i, int(cand_rows[best_k])))
+            best_idx_in_subset = int(np.argmax(scores))
+
+            matches.append((i, int(valid_cands[best_idx_in_subset])))
+            
         return matches
 
 
