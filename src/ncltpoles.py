@@ -75,15 +75,20 @@ def get_map_indices(session):
     return istart[:len(iend)], imid[:len(iend)], iend
 
 def save_global_map_position():
+    target_sessions = pynclt.sessions[args.session_start:args.session_end]
+    print("target sessions", target_sessions)
+
     globalmappos = np.empty([0, 2])
-    mapfactors = np.full(len(pynclt.sessions), np.nan)
+    mapfactors = np.full(len(target_sessions), np.nan)
     poleparams = np.empty([0, 3])
     all_descs = []
-    for isession, s in enumerate(pynclt.sessions):
+
+    for isession, s in enumerate(target_sessions):
         print(s)
         session = pynclt.session(s)
         istart, imid, iend = get_map_indices(session)
         localmappos = session.T_w_r_gt_velo[imid, :2, 3]
+
         if globalmappos.size == 0:
             imaps = range(localmappos.shape[0])
         else:
@@ -94,6 +99,7 @@ def save_global_map_position():
                 ).min()
                 if distance > remapdistance:
                     imaps.append(imap)
+
         globalmappos = np.vstack([globalmappos, localmappos[imaps]])
         mapfactors[isession] = np.true_divide(len(imaps), len(imid)) if len(imid) > 0 else 0.0
 
@@ -102,16 +108,16 @@ def save_global_map_position():
                 iscan = imid[imap]
                 xyz, _ = session.get_velo(iscan)
 
-                localpoleparam, desc = poles_extractor.detect_poles(
+                poleparams_local, desc = poles_extractor.detect_poles(
                     xyz, desc_dim=desc_dim, desc=True
                 )
-                if localpoleparam.shape[0] == 0:
+                if poleparams_local.shape[0] == 0:
                     bar.update(iimap)
                     continue
 
                 all_descs.append(desc)
 
-                localpoleparam_xy = localpoleparam[:, :2].T
+                localpoleparam_xy = poleparams_local[:, :2].T
                 localpoleparam_xy = np.vstack([
                     localpoleparam_xy,
                     np.zeros_like(localpoleparam_xy[0]),
@@ -119,9 +125,9 @@ def save_global_map_position():
                 ])
                 T_w_r = session.T_w_r_gt_velo[imid[imap]]
                 localpoleparam_xy_global = np.matmul(T_w_r, localpoleparam_xy)
-                localpoleparam[:, :2] = localpoleparam_xy_global[:2, :].T
+                poleparams_local[:, :2] = localpoleparam_xy_global[:2, :].T
 
-                poleparams = np.vstack([poleparams, localpoleparam])
+                poleparams = np.vstack([poleparams, poleparams_local])
 
                 bar.update(iimap)
 
@@ -138,8 +144,8 @@ def save_global_map_position():
         if len(ci) < n_mapdetections:
             continue
 
-        local_poleparams = poleparams[ci, :]      # (Nc, 3)
-        local_descs = descs_array[ci, :]          # (Nc, desc_dim)
+        local_poleparams = poleparams[ci, :]
+        local_descs = descs_array[ci, :]
 
         cluster_means, cluster_descs = feature_utils.merge_cluster_descriptors(
             local_poleparams,
@@ -165,6 +171,7 @@ def save_global_map_position():
     print(f"polemeans.shape: {clustermeans.shape}, descmeans.shape: {clusterdescs.shape}")
 
     report_utils.plot_global_map(globalmapfile)
+
 
 
 def save_global_map():
@@ -613,6 +620,15 @@ if __name__ == '__main__':
     parser.add_argument('--nprobe', type=int, default=None, help='FAISS IVF nprobe')
     parser.add_argument('--desc_dim', type=int, default=64, help='descriptor dimension (default: 64)')
     parser.add_argument('--eval_out', type=str, default=None, help='path to save evaluation summary (default: stdout)')
+    parser.add_argument('--mode', type=str, default='full',
+                        choices=['full', 'build_map', 'localize'],
+                        help='full: build map + localize + evaluate; '
+                            'build_map: only build global map; '
+                            'localize: only localize & evaluate with existing map')
+    parser.add_argument('--session_start', type=int, default=0,
+                        help='start index in pynclt.sessions (inclusive)')
+    parser.add_argument('--session_end', type=int, default=len(pynclt.sessions),
+                        help='end index in pynclt.sessions (exclusive)')
     args = parser.parse_args()
     
     do_quant = args.quant is not None
@@ -623,12 +639,23 @@ if __name__ == '__main__':
     ivf_nlist = args.nlist
     ivf_nprobe = args.nprobe
     
-    # save_global_map()
-    # for session in pynclt.sessions:
-    #     save_local_maps(session)
-    #     localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
-
-    evaluate(output_path=args.eval_out)
-    
-    # report_utils.plot_timing_stacked_for_sessions(pynclt.sessions, base_dir="nclt")
-    # report_utils.report_max_timing_for_sessions(pynclt.sessions, base_dir="nclt")
+    target_sessions = pynclt.sessions[args.session_start:args.session_end]
+    if args.mode == 'full':
+        print(f"[MODE full] Build global map + save localmaps + localize, "
+              f"sessions[{args.session_start}:{args.session_end}]")
+        save_global_map_position()
+        for session in target_sessions:
+            save_local_maps(session)
+            localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        evaluate(output_path=args.eval_out)
+    elif args.mode == 'build_map':
+        print(f"[MODE build_map] Only build global map using "
+              f"sessions[{args.session_start}:{args.session_end}]")
+        save_global_map_position()
+    elif args.mode == 'localize':
+        print(f"[MODE localize] Only localize & evaluate on "
+              f"sessions[{args.session_start}:{args.session_end}] "
+              "(assuming localmaps already exist)")
+        for session in target_sessions:
+            localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        evaluate(output_path=args.eval_out)

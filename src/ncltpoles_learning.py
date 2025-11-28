@@ -30,10 +30,17 @@ parser.add_argument('--nprobe', type=int, default=None, help='FAISS IVF nprobe')
 parser.add_argument('--n_mapdetections', type=int, default=5, help='number of mapdetections')
 parser.add_argument('--mapinterval', type=float, default=0.25, help='mapinterval')
 parser.add_argument('--n_locdetections', type=int, default=1, help='n_locdetections')
-parser.add_argument('--session_start', type=int, default=0, help='session_start')
-parser.add_argument('--session_end', type=int, default=27, help='session_end')
 parser.add_argument('--desc_dim', type=int, default=64, help='descriptor dimension (default: 64)')
 parser.add_argument('--eval_out', type=str, default=None, help='path to save evaluation summary (default: stdout)')
+parser.add_argument('--mode', type=str, default='full',
+                    choices=['full', 'build_map', 'localize'],
+                    help='full: build map + localize + evaluate; '
+                        'build_map: only build global map; '
+                        'localize: only localize & evaluate with existing map')
+parser.add_argument('--session_start', type=int, default=0,
+                    help='start index in pynclt.sessions (inclusive)')
+parser.add_argument('--session_end', type=int, default=len(pynclt.sessions),
+                    help='end index in pynclt.sessions (exclusive)')
 args = parser.parse_args()
 
 # Load Model
@@ -102,11 +109,12 @@ def get_map_indices(session):
     return istart[:len(iend)], imid[:len(iend)], iend
 
 def save_global_map_position():
+    target_sessions = pynclt.sessions[args.session_start:args.session_end]
     globalmappos = np.empty([0, 2])
-    mapfactors = np.full(len(pynclt.sessions), np.nan)
+    mapfactors = np.full(len(target_sessions), np.nan)
     poleparams = np.empty([0, 3])
     all_descs = []
-    for isession, s in enumerate(pynclt.sessions):
+    for isession, s in enumerate(target_sessions):
         print(s)
         session = pynclt.session(s)
         istart, imid, iend = get_map_indices(session)
@@ -342,7 +350,6 @@ def save_local_maps(sessionname, visualize=False):
                 xyz, model, device, cut_z=False, desc_dim=desc_dim, desc=True, vis=False)
             all_descs.append(desc)
                 
-            tim_detect_ms.append((time.perf_counter_ns() - t0) / 1e6)
             ts_localmaps.append(session.t_velo[imid[i]])
 
             localpoleparam_xy = poleparams[:, :2]
@@ -623,16 +630,23 @@ if __name__ == '__main__':
     ivf_nlist = args.nlist
     ivf_nprobe = args.nprobe
     
-    # save_global_map_position()
-    #save_global_map()
-    # for session in pynclt.sessions[args.session_start:args.session_end]:
-    #     save_local_maps(session)
-    #     localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
-
-    evaluate(output_path=args.eval_out)
-    
-    # [Refactor] Use report_utils
-    # report_utils.plot_timing_stacked_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
-    # report_utils.report_max_timing_for_sessions(pynclt.sessions[args.session_start:args.session_end], base_dir="nclt")
-    # report_utils.plot_detect_timeline_for_sessions(pynclt.sessions, base_dir="nclt")
-    # report_utils.report_pole_detect_timing_for_sessions(pynclt.sessions, base_dir="nclt")
+    target_sessions = pynclt.sessions[args.session_start:args.session_end]
+    if args.mode == 'full':
+        print(f"[MODE full] Build global map + save localmaps + localize, "
+              f"sessions[{args.session_start}:{args.session_end}]")
+        save_global_map_position()
+        for session in target_sessions:
+            save_local_maps(session)
+            localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        evaluate(output_path=args.eval_out)
+    elif args.mode == 'build_map':
+        print(f"[MODE build_map] Only build global map using "
+              f"sessions[{args.session_start}:{args.session_end}]")
+        save_global_map_position()
+    elif args.mode == 'localize':
+        print(f"[MODE localize] Only localize & evaluate on "
+              f"sessions[{args.session_start}:{args.session_end}] "
+              "(assuming localmaps already exist)")
+        for session in target_sessions:
+            localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        evaluate(output_path=args.eval_out)
