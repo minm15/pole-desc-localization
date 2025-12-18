@@ -193,6 +193,7 @@ def save_global_map_position():
 
 
 def save_global_map():
+    target_sessions = pynclt.sessions[args.session_start:args.session_end]
     POS_MATCH_THRESHOLD_METERS = 8.0
     DESC_SCORE_TOLERANCE = 0.2
     DESC_MIN_SCORE_THRESHOLD = 3
@@ -204,7 +205,8 @@ def save_global_map():
     all_raw_poles_list = []
     all_raw_descs_list = []
 
-    for isession, s in enumerate(pynclt.sessions[args.session_start:args.session_end]):
+    print(target_sessions)
+    for isession, s in enumerate(target_sessions):
         print(s)
         session = pynclt.session(s)
         istart, imid, iend = get_map_indices(session)
@@ -350,7 +352,6 @@ def save_local_maps(sessionname, visualize=False):
                 xyz, model, device, cut_z=False, desc_dim=desc_dim, desc=True, vis=False)
             all_descs.append(desc)
                 
-            ts_localmaps.append(session.t_velo[imid[i]])
 
             localpoleparam_xy = poleparams[:, :2]
             localpoleparam_xy = localpoleparam_xy.T
@@ -634,7 +635,7 @@ if __name__ == '__main__':
     if args.mode == 'full':
         print(f"[MODE full] Build global map + save localmaps + localize, "
               f"sessions[{args.session_start}:{args.session_end}]")
-        save_global_map_position()
+        #save_global_map_position()
         for session in target_sessions:
             save_local_maps(session)
             localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
@@ -642,7 +643,8 @@ if __name__ == '__main__':
     elif args.mode == 'build_map':
         print(f"[MODE build_map] Only build global map using "
               f"sessions[{args.session_start}:{args.session_end}]")
-        save_global_map_position()
+        # save_global_map_position()
+        save_global_map()
     elif args.mode == 'localize':
         print(f"[MODE localize] Only localize & evaluate on "
               f"sessions[{args.session_start}:{args.session_end}] "

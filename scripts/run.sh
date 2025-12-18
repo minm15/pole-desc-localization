@@ -27,39 +27,39 @@ LOG_C_LEARN="results_setC_learning.txt"
 LOG_C_BASE="results_setC_baseline.txt"
 
 # 先把舊的 log 清掉，避免誤混
-: > "${LOG_A_LEARN}"
-: > "${LOG_A_BASE}"
+# : > "${LOG_A_LEARN}"
+# : > "${LOG_A_BASE}"
 : > "${LOG_B_LEARN}"
 : > "${LOG_B_BASE}"
 : > "${LOG_C_LEARN}"
 : > "${LOG_C_BASE}"
 
-echo "========================================"
-echo " Set A: All sessions (build map + loc)"
-echo "========================================"
-./scripts/clear.sh
+# echo "========================================"
+# echo " Set A: All sessions (build map + loc)"
+# echo "========================================"
+# ./scripts/clear.sh
 
 # ---------- Set A: Learning ----------
-echo "[Set A][Learning] Build global map + save localmaps + localize on all sessions" | tee -a "${LOG_A_LEARN}"
-${LEARNING_CMD} \
-  --mode full \
-  --session_start 0 \
-  --session_end ${N_SESS} \
-  --eval_out "${LOG_A_LEARN}"
+# echo "[Set A][Learning] Build global map + save localmaps + localize on all sessions" | tee -a "${LOG_A_LEARN}"
+# ${LEARNING_CMD} \
+#   --mode full \
+#   --session_start 0 \
+#   --session_end ${N_SESS} \
+#   --eval_out "${LOG_A_LEARN}"
 
 # ---------- Set A: Baseline ----------
-echo "[Set A][Baseline] Build global map + save localmaps + localize on all sessions" | tee -a "${LOG_A_BASE}"
-${BASELINE_CMD} \
-  --mode full \
-  --session_start 0 \
-  --session_end ${N_SESS} \
-  --eval_out "${LOG_A_BASE}"
+# echo "[Set A][Baseline] Build global map + save localmaps + localize on all sessions" | tee -a "${LOG_A_BASE}"
+# ${BASELINE_CMD} \
+#   --mode full \
+#   --session_start 0 \
+#   --session_end ${N_SESS} \
+#   --eval_out "${LOG_A_BASE}"
 
 
-echo "========================================"
-echo " Set B: Eval1 (map: 01-08~02-19, loc: 03-17~04-29)"
-echo "========================================"
-./scripts/clear.sh
+# echo "========================================"
+# echo " Set B: Eval1 (map: 01-08~02-19, loc: 03-17~04-29)"
+# echo "========================================"
+# ./scripts/clear.sh
 
 # ---------- Set B, Part 1: 只用 [0,9) 建 global map ----------
 echo "[Set B][Learning] Building global map from sessions[0,${IDX_EVAL1_MAP_END})" | tee -a "${LOG_B_LEARN}"

@@ -179,6 +179,7 @@ def save_global_map():
     Incrementally builds the global feature map using position-first, 
     score-based matching.
     """
+    target_sessions = pynclt.sessions[args.session_start:args.session_end]
     # --- Thresholds ---
     POS_MATCH_THRESHOLD_METERS = 10.0
     DESC_SCORE_TOLERANCE = 0.2
@@ -192,7 +193,8 @@ def save_global_map():
     all_raw_poles_list = []
     all_raw_descs_list = []
 
-    for isession, s in enumerate(pynclt.sessions):
+    print(target_sessions)
+    for isession, s in enumerate(target_sessions):
         print(s)
         session = pynclt.session(s)
         istart, imid, iend = get_map_indices(session)
@@ -523,7 +525,8 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
 
 def evaluate(output_path=None):
     stats = []
-    for sessionname in pynclt.sessions:
+    target_sessions = pynclt.sessions[args.session_start:args.session_end]
+    for sessionname in target_sessions:
         files = [file for file in os.listdir(os.path.join(pynclt.resultdir, sessionname)) if file.startswith(get_locfileprefix())]
         files.sort()
         session = pynclt.session(sessionname)
@@ -556,7 +559,7 @@ def evaluate(output_path=None):
             
             T_gt_est.append(np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_interp)[:inum, ...])
             T_gt_est_knn.append(np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_knn_interp)[:inum, ...])
-            
+        
         T_gt_est = np.stack(T_gt_est) 
         T_gt_est_knn = np.stack(T_gt_est_knn) 
         L = T_gt_est.shape[1]
@@ -645,13 +648,14 @@ if __name__ == '__main__':
               f"sessions[{args.session_start}:{args.session_end}]")
         save_global_map_position()
         for session in target_sessions:
-            save_local_maps(session)
+            #save_local_maps(session)
             localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
         evaluate(output_path=args.eval_out)
     elif args.mode == 'build_map':
         print(f"[MODE build_map] Only build global map using "
               f"sessions[{args.session_start}:{args.session_end}]")
-        save_global_map_position()
+        # save_global_map_position()
+        save_global_map()
     elif args.mode == 'localize':
         print(f"[MODE localize] Only localize & evaluate on "
               f"sessions[{args.session_start}:{args.session_end}] "

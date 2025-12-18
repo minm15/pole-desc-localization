@@ -190,22 +190,42 @@ class particlefilter:
         return matches
 
 
-    def matcher_quant(self, local_descs: np.ndarray):
+    def matcher_quant(self, local_descs: np.ndarray, current_pose_w: np.ndarray, search_radius: float = 20.0):
         """
-        IVF-only matcher for quantized descriptors.
-        For each local row, retrieve ALL candidates from the probed lists (no cap),
-        score with equal & non-zero, pick the best row index.
-        Returns: List[(i_local, j_global_row)]
+        IVF-only matcher for quantized descriptors with Geometric Filtering.
         """
         matches: list[tuple[int, int]] = []
         ivf = self.descmap_index  # KMeansIVF object
+        
+        # Extract robot position
+        rx, ry = current_pose_w[0, 3], current_pose_w[1, 3]
+
         for i, d1 in enumerate(local_descs):
+            # 1. Get candidates from IVF
             cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
             if not cand_rows:
                 matches.append((i, -1))
                 continue
-            C = self.descmap[cand_rows]  # (K,64)
-            scores = self._score_equal_nonzero(d1, C)
+
+            # 2. Geometric Filtering (Radius check)
+            cand_indices = np.array(cand_rows, dtype=int)
+            cand_pos = self.descxy[cand_indices, :2] # (N_cand, 2)
+            
+            dist_sq = (cand_pos[:, 0] - rx)**2 + (cand_pos[:, 1] - ry)**2
+            valid_mask = dist_sq < (search_radius ** 2)
+            
+            valid_cands = cand_indices[valid_mask]
+            
+            if len(valid_cands) == 0:
+                matches.append((i, -1))
+                continue
+
+            # 3. Scoring (Using valid candidates)
+            C = self.descmap[valid_cands]  # (K,64)
+            scores = self._score_equal_nonzero(d1, C) # Keep the quantization-specific scoring
             best_k = int(np.argmax(scores))
-            matches.append((i, int(cand_rows[best_k])))
+
+            # valid_cands[best_k] maps back to the global index
+            matches.append((i, int(valid_cands[best_k])))
+            
         return matches
