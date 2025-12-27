@@ -405,11 +405,6 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
         T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
-    
-    knn_filter = particlefilter.particlefilter(500, 
-        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
-    knn_filter.estimatetype = 'best'
-    knn_filter.minneff = 0.5
 
     if visualize:
         plt.ion(); figure = plt.figure()
@@ -423,35 +418,18 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     T_w_r_est = np.full([session.t_relodo.size, 4, 4], np.nan)
     T_w_r_est_knn = np.full([session.t_relodo.size, 4, 4], np.nan)
     T = session.t_relodo.size
-    tim_total_ms            = np.zeros(T, dtype=np.float32) 
-    tim_update_measurement_ms = np.zeros(T, dtype=np.float32) 
-    tim_estimate_pose_ms    = np.zeros(T, dtype=np.float32)
-    tim_knn_update_ms       = np.zeros(T, dtype=np.float32)
-    tim_knn_measurement_ms  = np.zeros(T, dtype=np.float32)
-    tim_knn_estimate_ms     = np.zeros(T, dtype=np.float32)
     n_active_per_step         = np.zeros(T, dtype=np.int32)
 
     with progressbar.ProgressBar(max_value=session.t_relodo.size) as bar:
-        for i in range(istart, session.t_relodo.size):
-            t_step0_ns = time.perf_counter_ns()
-            
+        for i in range(istart, session.t_relodo.size):            
             relodocov = np.empty([3, 3])
             relodocov[:2, :2] = session.relodocov[i, :2, :2]
             relodocov[:, 2] = session.relodocov[i, [0, 1, 5], 5]
             relodocov[2, :] = session.relodocov[i, 5, [0, 1, 5]]
             
             # Motion Update
-            filter.update_motion(session.relodo[i], relodocov * 2.0**2)
-            knn_filter.update_motion(session.relodo[i], relodocov * 2.0**2)
-            
-            t0_ns = time.perf_counter_ns()
+            filter.update_motion(session.relodo[i], relodocov * 2.0**2)            
             T_w_r_est[i] = filter.estimate_pose()
-            tim_estimate_pose_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
-            
-            t0_ns = time.perf_counter_ns()
-            T_w_r_est_knn[i] = knn_filter.estimate_pose()
-            tim_knn_estimate_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
-            
             # Measurement Update
             t_now = session.t_relodo[i]
             if imap < locdata.shape[0]:
@@ -483,45 +461,16 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                         if quant:
                             desc = feature_utils.quantize_descriptor(desc, thresholds)
                         
-                        # Filter Measurement
-                        t0_ns = time.perf_counter_ns()
-                        filter.update_measurement(desc, polepos_r_now[:2].T)
-                        tim_update_measurement_ms[i] = (time.perf_counter_ns() - t0_ns) / 1e6
-                        
-                        # Re-estimate
-                        t0_ns = time.perf_counter_ns()
+                        filter.update_measurement(desc, polepos_r_now[:2].T)                   
                         T_w_r_est[i] = filter.estimate_pose()
-                        tim_estimate_pose_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
-                    
-                    # KNN Measurement
-                    if iactive:
-                        # ... (same transform logic) ...
-                        t_mid = session.t_velo[locdata[imap]['imid']]
-                        T_w_r_mid = util.project_xy(session.get_T_w_r_odo(t_mid).dot(T_r_mc)).dot(T_mc_r)
-                        T_w_r_now = util.project_xy(session.get_T_w_r_odo(t_now).dot(T_r_mc)).dot(T_mc_r)
-                        T_r_now_r_mid = util.invert_ht(T_w_r_now).dot(T_w_r_mid)
-                        polepos_r_now = T_r_now_r_mid.dot(T_r_m).dot(polepos_m[imap][:, iactive])
-                        
-                        t0_ns = time.perf_counter_ns()
-                        knn_filter.update_measurement_knn(polepos_r_now[:2].T)
-                        tim_knn_measurement_ms[i] = (time.perf_counter_ns() - t0_ns) / 1e6
-                        
-                        t0_ns = time.perf_counter_ns()
-                        T_w_r_est_knn[i] = knn_filter.estimate_pose()
-                        tim_knn_estimate_ms[i] += (time.perf_counter_ns() - t0_ns) / 1e6
-
+            
                     imap += 1
             
-            tim_total_ms[i] = (time.perf_counter_ns() - t_step0_ns) / 1e6
             bar.update(i)
             
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))
-    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object),
-            tim_total_ms=tim_total_ms, tim_update_measurement_ms=tim_update_measurement_ms, tim_estimate_pose_ms=tim_estimate_pose_ms,
-            tim_knn_update_ms=tim_knn_update_ms, tim_knn_measurement_ms=tim_knn_measurement_ms, tim_knn_estimate_ms=tim_knn_estimate_ms,
-            n_active_per_step=n_active_per_step,)
-    print('append_count', append_count)
+    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object))
 
 def evaluate(output_path=None):
     stats = []
@@ -536,16 +485,14 @@ def evaluate(output_path=None):
         t_eval = scipy.interpolate.interp1d(cumdist, session.t_gt)(np.arange(0.0, cumdist[-1], 1.0))
         T_w_r_gt = np.stack([util.project_xy(session.get_T_w_r_gt(t).dot(T_r_mc)).dot(T_mc_r) for t in t_eval])
 
-        T_gt_est, T_gt_est_knn = [], []
+        T_gt_est = []
         for file in files:
             fpath = os.path.join(pynclt.resultdir, sessionname, file)
             data = np.load(fpath)
             T_w_r_est = data['T_w_r_est']
-            T_w_r_est_knn = data['T_w_r_est_knn']
             
             # Interpolation Logic
             T_w_r_est_interp = np.empty([len(t_eval), 4, 4])
-            T_w_r_est_knn_interp = np.empty([len(t_eval), 4, 4])
             iodo = 1; inum = 0
             for ieval in range(len(t_eval)):
                 while session.t_relodo[iodo] < t_eval[ieval]:
@@ -554,35 +501,27 @@ def evaluate(output_path=None):
                 if iodo >= session.t_relodo.shape[0]: break
                 
                 T_w_r_est_interp[ieval] = util.interpolate_ht(T_w_r_est[iodo-1:iodo+1], session.t_relodo[iodo-1:iodo+1], t_eval[ieval])
-                T_w_r_est_knn_interp[ieval] = util.interpolate_ht(T_w_r_est_knn[iodo-1:iodo+1], session.t_relodo[iodo-1:iodo+1], t_eval[ieval])
                 inum += 1
             
             T_gt_est.append(np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_interp)[:inum, ...])
-            T_gt_est_knn.append(np.matmul(util.invert_ht(T_w_r_gt), T_w_r_est_knn_interp)[:inum, ...])
         
         T_gt_est = np.stack(T_gt_est) 
-        T_gt_est_knn = np.stack(T_gt_est_knn) 
         L = T_gt_est.shape[1]
         t_plot = t_eval[:L]  
 
         poserrors = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)
         poserror_mean = np.mean(poserrors, axis=0)
-        poserrors_knn = np.linalg.norm(T_gt_est_knn[..., :2, 3], axis=-1)
-        poserror_mean_knn = np.mean(poserrors_knn, axis=0)
 
-        report_utils.plot_evaluation_result(sessionname=sessionname, 
-                               poserror_mean=poserror_mean, 
-                               poserror_mean_knn=poserror_mean_knn,
-                               t_plot=t_plot, 
-                               files=files,
-                               result_dir=pynclt.resultdir)
+        # report_utils.plot_evaluation_result(sessionname=sessionname, 
+        #                        poserror_mean=poserror_mean, 
+        #                        t_plot=t_plot, 
+        #                        files=files,
+        #                        result_dir=pynclt.resultdir)
 
         # Stats Calculation
         lonerror = np.mean(np.mean(np.abs(T_gt_est[..., 0, 3]), axis=-1))
         laterror = np.mean(np.mean(np.abs(T_gt_est[..., 1, 3]), axis=-1))
         poserror = np.mean(np.mean(poserrors, axis=-1))
-        poserror_knn = np.mean(np.mean(poserrors_knn, axis=-1))
-        print(poserror, poserror_knn)
         posrmse = np.mean(np.sqrt(np.mean(poserrors**2, axis=-1)))
         angerrors = np.degrees(np.abs(np.array([util.ht2xyp(T)[:, 2] for T in T_gt_est])))
         angerror = np.mean(np.mean(angerrors, axis=-1))

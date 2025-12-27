@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
+DESC_DIM = 62
 
 # ===============================
 # Binary / presence helpers
@@ -13,7 +14,7 @@ def to_presence_bits(descs: np.ndarray) -> np.ndarray:
     Convert (N,64) uint8 descriptors to presence bits in {0,1}:
     1 means the dimension is non-zero (valid), 0 means absent.
     """
-    assert descs.ndim == 2 and descs.shape[1] == 64, "Expect (N,64) uint8"
+    assert descs.ndim == 2 and descs.shape[1] == DESC_DIM, "Expect (N,64) uint8"
     return (descs != 0).astype(np.uint8)
 
 
@@ -22,7 +23,7 @@ def packbits_be(bits01: np.ndarray) -> np.ndarray:
     Pack (N,64) bits (0/1) into (N,8) bytes using big-endian bit order.
     Suitable for faiss.IndexBinary* (d_bits=64).
     """
-    assert bits01.ndim == 2 and bits01.shape[1] == 64, "Expect (N,64) bits"
+    assert bits01.ndim == 2 and bits01.shape[1] == DESC_DIM, "Expect (N,64) bits"
     return np.packbits(bits01, axis=1, bitorder="big")
 
 
@@ -105,7 +106,7 @@ def train_binary_kmeans_l2_round(
             "  pip install faiss-cpu"
         ) from e
 
-    assert P_bits.ndim == 2 and P_bits.shape[1] == 64, "Expect presence bits (N,64)"
+    assert P_bits.ndim == 2 and P_bits.shape[1] == DESC_DIM, "Expect presence bits (N,64)"
     X = P_bits.astype(np.float32, copy=False)
     d = X.shape[1]
 
@@ -175,7 +176,7 @@ class KMeansIVF:
             ValueError if there are no valid (non-zero) descriptors.
         """
         print(map_descs.shape)
-        assert map_descs.ndim == 2 and map_descs.shape[1] == 64, \
+        assert map_descs.ndim == 2 and map_descs.shape[1] == DESC_DIM, \
             "map_descs must be (N,64) uint8"
 
         self._map_descs = map_descs
@@ -255,7 +256,7 @@ class KMeansIVF:
         Returns:
             List[int] of candidate map_ids.
         """
-        assert q_desc.ndim == 1 and q_desc.shape[0] == 64 and q_desc.dtype == np.uint8, \
+        assert q_desc.ndim == 1 and q_desc.shape[0] == DESC_DIM and q_desc.dtype == np.uint8, \
             "q_desc must be (64,) uint8"
         assert self._centroids_packed is not None and self._lists is not None, "Index not built"
 
