@@ -1,0 +1,2 @@
+[Set C][Baseline] Building global map from sessions[0,23)
+[Set C][Baseline] Localizing on sessions[23,27)

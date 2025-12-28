@@ -144,7 +144,7 @@ class ZeroAwareIVF:
         self.nlist: int = 128
         self.nprobe: int = 4
         self.seed: int = 2025
-        self.niter: int = 20
+        self.niter: int = 15
 
         # Additional weights (tunable)
         self.alpha_value: float = 1.0   # weight for value differences

@@ -21,6 +21,7 @@ import sys
 
 import feature_utils
 import report_utils
+import plot_util
 
 # --- Argument Parsing & Model Loading ---
 parser = argparse.ArgumentParser(description='Pole Loc Learning with Descriptor')
@@ -436,11 +437,43 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     print("[IVF] build stats:", build_stats)
     descmap_index, edges = ivf, None
     
+    ### export ivf map to the bin file for gem5 simulation
+    if quant:
+        from export_gem5 import export_ivf_map 
+        export_dir = os.path.join("export_gem5", sessionname, "map") 
+        
+        map_json = export_ivf_map(
+            export_dir,
+            descmap_f32=descmap,
+            descxy_f32=descxy,
+            ivf=ivf,
+            desc_bits=4,
+            geo_max=90,
+            geo_qparams=geo_qparams, 
+        )
+        print("[export] map.json ->", map_json)
+    
     filter = particlefilter.particlefilter(10000, 
         T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, 
         descxy_u8=descxy_u8, geo_qparams=geo_qparams, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
+    
+    ### gem5 query export writer
+    if quant:
+        from export_gem5 import export_queries_begin
+        export_root = os.path.join("export_gem5", sessionname)
+        map_json_ref = os.path.join(export_root, "map", "map.json")
+        query_out_dir = os.path.join(export_root, "query")
+
+        qwriter = export_queries_begin(
+            out_dir=query_out_dir,
+            sessionname=sessionname,
+            desc_bits=4,          
+            geo_max=90,         
+            geo_qparams=geo_qparams, 
+            map_json_ref=map_json_ref,
+        )
 
     imap = 0
     while imap < locdata.shape[0] - 1 and \
@@ -450,7 +483,8 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     T_w_r_est = np.full([session.t_relodo.size, 4, 4], np.nan)
     T_w_r_est_knn = np.full([session.t_relodo.size, 4, 4], np.nan)
     T = session.t_relodo.size
-    n_active_per_step         = np.zeros(T, dtype=np.int32)
+    n_active_per_step = np.zeros(T, dtype=np.int32)
+    measurement_update_times = []
 
     with progressbar.ProgressBar(max_value=session.t_relodo.size) as bar:
         for i in range(istart, session.t_relodo.size):
@@ -492,13 +526,29 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                         desc = desclocal[imap][iactive]
                         if quant:
                             desc = feature_utils.quantize_descriptor(desc, thresholds)
+                            
+                        est_pose = filter.estimate_pose()
+                        rx, ry = est_pose[0, 3], est_pose[1, 3]
+                        qrx, qry = feature_utils.quantize_xy_to_u6_shared(rx, ry, min_x, min_y, R, MAX=90)
+                        qwriter.add_step(qrx, qry, desc.astype(np.uint8, copy=False), relodo_i=i, t_now=float(t_now))
 
+                        # time profiling
+                        t_start = time.perf_counter()
                         filter.update_measurement(desc, polepos_r_now[:2].T)
+                        t_end = time.perf_counter()
+                        
+                        # insert the time data
+                        measurement_update_times.append(t_end - t_start)
                         T_w_r_est[i] = filter.estimate_pose()
 
                     imap += 1
             bar.update(i)
 
+    qwriter.close() # close query writer
+    plot_filename = f"perf_update_measurement_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    plot_path = os.path.join(session.dir, plot_filename)
+    
+    plot_util.save_performance_plot(measurement_update_times, plot_path)
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))
     np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object))
