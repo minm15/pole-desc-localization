@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-desc_dim = 62
+desc_dim = 64
 
 
 # -------- helpers (same semantics as your original) --------

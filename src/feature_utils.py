@@ -90,3 +90,26 @@ def quantize_descriptor(vec: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
         idxs = np.digitize(vec[nz], thresholds, right=False)
         q[nz] = idxs + 1
     return q
+
+def quantize_xy_to_u6_shared(x, y, min_x, min_y, R, MAX=90):
+    QMAX = MAX
+    if R <= 0.0:
+        return np.uint8(0), np.uint8(0)
+
+    qx = int(np.rint((float(x) - float(min_x)) * QMAX / float(R)))
+    qy = int(np.rint((float(y) - float(min_y)) * QMAX / float(R)))
+
+    qx = 0 if qx < 0 else (MAX if qx > MAX else qx)
+    qy = 0 if qy < 0 else (MAX if qy > MAX else qy)
+    return np.uint8(qx), np.uint8(qy)
+
+def quantize_xy_array_to_u6_shared(xy, min_x, min_y, R, MAX=90):
+    if R <= 0.0:
+        return np.zeros((xy.shape[0], 2), dtype=np.uint8)
+
+    qx = np.rint((xy[:, 0].astype(np.float64) - float(min_x)) * MAX / float(R)).astype(np.int32)
+    qy = np.rint((xy[:, 1].astype(np.float64) - float(min_y)) * MAX / float(R)).astype(np.int32)
+
+    qx = np.clip(qx, 0, MAX).astype(np.uint8)
+    qy = np.clip(qy, 0, MAX).astype(np.uint8)
+    return np.stack([qx, qy], axis=1)

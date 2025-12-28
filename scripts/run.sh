@@ -2,7 +2,7 @@
 set -e
 
 # parameter
-COMMON_ARGS="--nlist 1024 --nprobe 32 --desc_dim 62"
+COMMON_ARGS="--nlist 1024 --nprobe 32 --desc_dim 64"
 
 # alias
 LEARNING_CMD="python src/ncltpoles_learning.py ${COMMON_ARGS}"

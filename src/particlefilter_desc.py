@@ -1,10 +1,11 @@
 import numpy as np
 import scipy
 import util
+import feature_utils
 
 class particlefilter:
     def __init__(self, count, start, posrange, angrange, 
-            polemeans, polevar, descmap, descxy, descmap_index, edges, quant, T_w_o=np.identity(4), d_max = 2.0):
+            polemeans, polevar, descmap, descxy, descmap_index, edges, quant, T_w_o=np.identity(4), d_max = 2.0, descxy_u8=None, geo_qparams=None):
         self.p_min = 0.01
         self.d_max = d_max
         self.minneff = 0.5
@@ -23,6 +24,8 @@ class particlefilter:
         self.descmap_index = descmap_index
         self.edges = edges
         self.quant = quant
+        self.descxy_u8 = descxy_u8
+        self.geo_qparams = geo_qparams
         self.poledist = scipy.stats.norm(loc=0.0, scale=np.sqrt(polevar))
         self.kdtree = scipy.spatial.cKDTree(polemeans[:, :2], leafsize=3)
         self.T_w_o = T_w_o
@@ -191,41 +194,36 @@ class particlefilter:
 
 
     def matcher_quant(self, local_descs: np.ndarray, current_pose_w: np.ndarray, search_radius: float = 20.0):
-        """
-        IVF-only matcher for quantized descriptors with Geometric Filtering.
-        """
         matches: list[tuple[int, int]] = []
-        ivf = self.descmap_index  # KMeansIVF object
-        
-        # Extract robot position
+        ivf = self.descmap_index
+
+        min_x, min_y, R = self.geo_qparams
         rx, ry = current_pose_w[0, 3], current_pose_w[1, 3]
+        qrx, qry = feature_utils.quantize_xy_to_u6_shared(rx, ry, min_x, min_y, R)
 
         for i, d1 in enumerate(local_descs):
-            # 1. Get candidates from IVF
             cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
             if not cand_rows:
                 matches.append((i, -1))
                 continue
 
-            # 2. Geometric Filtering (Radius check)
-            cand_indices = np.array(cand_rows, dtype=int)
-            cand_pos = self.descxy[cand_indices, :2] # (N_cand, 2)
-            
-            dist_sq = (cand_pos[:, 0] - rx)**2 + (cand_pos[:, 1] - ry)**2
-            valid_mask = dist_sq < (search_radius ** 2)
-            
-            valid_cands = cand_indices[valid_mask]
-            
+            cand_indices = np.array(cand_rows, dtype=np.int32)
+
+            cand_xy = self.descxy_u8[cand_indices]  # (Ncand,2) uint8
+            mx = cand_xy[:, 0].astype(np.int32)
+            my = cand_xy[:, 1].astype(np.int32)
+            qx = int(qrx); qy = int(qry)
+            geo_mask = (mx >= qx - 2) & (mx <= qx + 2) & (my >= qy - 2) & (my <= qy + 2)
+            valid_cands = cand_indices[geo_mask]
+
             if len(valid_cands) == 0:
                 matches.append((i, -1))
                 continue
 
-            # 3. Scoring (Using valid candidates)
+            # --- scoring ---
             C = self.descmap[valid_cands]  # (K,64)
-            scores = self._score_equal_nonzero(d1, C) # Keep the quantization-specific scoring
+            scores = self._score_equal_nonzero(d1, C)
             best_k = int(np.argmax(scores))
-
-            # valid_cands[best_k] maps back to the global index
             matches.append((i, int(valid_cands[best_k])))
-            
+
         return matches

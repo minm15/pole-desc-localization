@@ -305,7 +305,6 @@ def save_global_map():
              allpole=all_raw_poles_for_npz,
              descriptors=all_raw_descs_for_npz)
     
-    print(f"--- Incremental Map Build Complete ---")
     report_utils.plot_global_map(globalmapfile)
 
 def save_local_maps(sessionname, visualize=False):
@@ -356,7 +355,6 @@ def save_local_maps(sessionname, visualize=False):
                 xyz, model, device, cut_z=False, desc_dim=desc_dim, desc=True, vis=False)
             all_descs.append(desc)
                 
-
             localpoleparam_xy = poleparams[:, :2]
             localpoleparam_xy = localpoleparam_xy.T
             localpoleparam_xy = np.vstack([localpoleparam_xy, np.zeros_like(localpoleparam_xy[0]), np.ones_like(localpoleparam_xy[0])])
@@ -383,6 +381,20 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     polemap = mapdata['polemeans'][:, :2]
     descmap = mapdata['descmeans']
     descxy = mapdata['polemeans'][:, :2]
+    
+    # for geometry quantization
+    min_x = float(descxy[:, 0].min())
+    max_x = float(descxy[:, 0].max())
+    min_y = float(descxy[:, 1].min())
+    max_y = float(descxy[:, 1].max())
+
+    R = max(max_x - min_x, max_y - min_y)  # shared span (meters)
+    geo_qparams = (min_x, min_y, R)
+    print(geo_qparams)
+
+    descxy_u8 = None
+    if quant:
+        descxy_u8 = feature_utils.quantize_xy_array_to_u6_shared(descxy, min_x, min_y, R)
     
     qmap, thresholds = [], []
     if quant:
@@ -425,7 +437,8 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     descmap_index, edges = ivf, None
     
     filter = particlefilter.particlefilter(10000, 
-        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
+        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, 
+        descxy_u8=descxy_u8, geo_qparams=geo_qparams, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
 
@@ -468,7 +481,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                     append_count += 1
                     
                     # desc
-                    if len(iactive) >= 4:
+                    if len(iactive) >= 3:
                         n_active_per_step[i] = len(iactive)
                         t_mid = session.t_velo[locdata[imap]['imid']]
                         T_w_r_mid = util.project_xy(session.get_T_w_r_odo(t_mid).dot(T_r_mc)).dot(T_mc_r)

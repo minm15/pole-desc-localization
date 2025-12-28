@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-DESC_DIM = 62
+DESC_DIM = 64
 
 # ===============================
 # Binary / presence helpers
