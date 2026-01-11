@@ -14,11 +14,11 @@ import poles_extractor
 import argparse
 import time
 import collections
-from kmeans_ivf import KMeansIVF
-from zeroAwareIVF import ZeroAwareIVF
+from ivf.kmeans_ivf import KMeansIVF
+from ivf.zeroAwareIVF import ZeroAwareIVF
 
-import feature_utils
-import report_utils
+import utils_.feature_utils as feature_utils
+import utils_.report_utils as report_utils
 
 # --- Configuration ---
 mapextent = np.array([30.0, 30.0, 5.0])

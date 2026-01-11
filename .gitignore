@@ -12,3 +12,4 @@ output.txt
 src/test_desc.py
 tmp_globalmap/
 results_summary.txt
+export_*/

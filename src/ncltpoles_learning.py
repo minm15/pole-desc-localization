@@ -13,15 +13,17 @@ import poles_extractor
 import argparse
 import time
 import collections
-from kmeans_ivf import KMeansIVF
-from zeroAwareIVF import ZeroAwareIVF
+from ivf.kmeans_ivf import KMeansIVF
+from ivf.zeroAwareIVF import ZeroAwareIVF
+import ivf.ivf_baselines as ivf_baselines
 from SalsaNext import * 
 import torch
 import sys
 
-import feature_utils
-import report_utils
-import plot_util
+import utils_.feature_utils as feature_utils
+import utils_.report_utils as report_utils
+import utils_.plot_util as plot_util
+import utils_.analysis_util as analysis_util
 
 # --- Argument Parsing & Model Loading ---
 parser = argparse.ArgumentParser(description='Pole Loc Learning with Descriptor')
@@ -43,7 +45,7 @@ parser.add_argument('--session_start', type=int, default=0,
 parser.add_argument('--session_end', type=int, default=len(pynclt.sessions),
                     help='end index in pynclt.sessions (exclusive)')
 parser.add_argument('--ivf_method', type=str, default='zeroaware',
-                    choices=['kmeans', 'zeroaware'],
+                    choices=['kmeans', 'zeroaware', 'baseline_l2', 'baseline_hamming'],
                     help='Choose IVF backend: kmeans (presence-only) or zeroaware (value+presence)')
 args = parser.parse_args()
 
@@ -388,10 +390,20 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     max_x = float(descxy[:, 0].max())
     min_y = float(descxy[:, 1].min())
     max_y = float(descxy[:, 1].max())
+    
+    GRID_SIZE_METERS = 5.0
 
     R = max(max_x - min_x, max_y - min_y)  # shared span (meters)
+    dynamic_max = int(np.ceil(R / GRID_SIZE_METERS))
     geo_qparams = (min_x, min_y, R)
     print(geo_qparams)
+    
+    if dynamic_max > 255:
+        print(f"[Warning] Map span is {R:.2f}m, which exceeds uint8 (255). Clamping MAX to 255.")
+        print(f"Current resolution: {R/255:.4f} meters/grid")
+        dynamic_max = 255
+    else:
+        print(f"[Info] Dynamic MAX set to {dynamic_max} for ~1m/grid resolution.")
 
     descxy_u8 = None
     if quant:
@@ -425,8 +437,16 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     map_ids = np.arange(desc_source.shape[0], dtype=np.int64)
     if IVF_METHOD == 'kmeans':
         ivf = KMeansIVF()
+    elif IVF_METHOD == 'baseline_l2':
+        print("[IVF] Using Baseline: Standard L2")
+        ivf = ivf_baselines.BaselineStandardL2()
+    elif IVF_METHOD == 'baseline_hamming':
+        print("[IVF] Using Baseline: Binary Hamming")
+        ivf = ivf_baselines.BaselineBinaryHamming()
     else:
+        print("[IVF] Using ZeroAware")
         ivf = ZeroAwareIVF()
+        
     if ivf_nlist is not None:
         if ivf_nlist < 1: raise ValueError("--nlist must be >= 1")
         ivf.nlist = ivf_nlist
@@ -434,6 +454,16 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
         if ivf_nprobe < 1: raise ValueError("--nprobe must be >= 1")
         ivf.nprobe = ivf_nprobe        
     build_stats = ivf.build(desc_source, map_ids=map_ids)
+    
+    # === 新增: 初始化 Profiler 並分析 Bucket 分佈 (在 ivf.build 之後) ===
+    profiler = analysis_util.IVFProfiler(
+        ivf_object=ivf, 
+        save_dir=os.path.join(session.dir, "profiling"), 
+        nprobe=ivf.nprobe  # 確保傳入正確的 nprobe
+    )
+    profiler.analyze_bucket_distribution() 
+    # ===============================================================
+    
     print("[IVF] build stats:", build_stats)
     descmap_index, edges = ivf, None
     
@@ -448,7 +478,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
             descxy_f32=descxy,
             ivf=ivf,
             desc_bits=4,
-            geo_max=90,
+            geo_max=dynamic_max,
             geo_qparams=geo_qparams, 
         )
         print("[export] map.json ->", map_json)
@@ -470,7 +500,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
             out_dir=query_out_dir,
             sessionname=sessionname,
             desc_bits=4,          
-            geo_max=90,         
+            geo_max=dynamic_max,         
             geo_qparams=geo_qparams, 
             map_json_ref=map_json_ref,
         )
@@ -515,7 +545,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                     append_count += 1
                     
                     # desc
-                    if len(iactive) >= 3:
+                    if len(iactive) >= 1:
                         n_active_per_step[i] = len(iactive)
                         t_mid = session.t_velo[locdata[imap]['imid']]
                         T_w_r_mid = util.project_xy(session.get_T_w_r_odo(t_mid).dot(T_r_mc)).dot(T_mc_r)
@@ -529,25 +559,35 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                             
                         est_pose = filter.estimate_pose()
                         rx, ry = est_pose[0, 3], est_pose[1, 3]
-                        qrx, qry = feature_utils.quantize_xy_to_u6_shared(rx, ry, min_x, min_y, R, MAX=90)
-                        qwriter.add_step(qrx, qry, desc.astype(np.uint8, copy=False), relodo_i=i, t_now=float(t_now))
+                        qrx, qry = feature_utils.quantize_xy_to_u6_shared(rx, ry, min_x, min_y, R, MAX=dynamic_max)
+                        if quant:
+                            qwriter.add_step(qrx, qry, desc.astype(np.uint8, copy=False), relodo_i=i, t_now=float(t_now))
 
                         # time profiling
                         t_start = time.perf_counter()
                         filter.update_measurement(desc, polepos_r_now[:2].T)
                         t_end = time.perf_counter()
                         
+                        # === 新增: 監控並記錄慢速 Frame ===
+                        t_elapsed = t_end - t_start
+                        # profiler.monitor_frame(
+                        #     t_elapsed_sec=t_elapsed, 
+                        #     query_descs=desc, 
+                        #     frame_idx=i, 
+                        #     t_now=t_now
+                        # )
+                        # ================================
+                        
                         # insert the time data
-                        measurement_update_times.append(t_end - t_start)
+                        measurement_update_times.append(t_elapsed)
                         T_w_r_est[i] = filter.estimate_pose()
 
                     imap += 1
             bar.update(i)
 
-    qwriter.close() # close query writer
+    if quant: qwriter.close() # close query writer
     plot_filename = f"perf_update_measurement_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
     plot_path = os.path.join(session.dir, plot_filename)
-    
     plot_util.save_performance_plot(measurement_update_times, plot_path)
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))

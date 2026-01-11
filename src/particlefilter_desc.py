@@ -1,7 +1,7 @@
 import numpy as np
 import scipy
 import util
-import feature_utils
+import utils_.feature_utils as feature_utils
 
 class particlefilter:
     def __init__(self, count, start, posrange, angrange, 
@@ -138,27 +138,6 @@ class particlefilter:
         nz = (C != 0)
         eq = (C == q[None, :])
         return (eq & nz).sum(axis=1)
-    
-    # def matcher(self, local_descs: np.ndarray):
-    #     """
-    #     IVF-only matcher for non-quantized descriptors.
-    #     For each local row, retrieve ALL candidates from the probed lists (no cap),
-    #     score with tolerance & non-zero, pick the best row index.
-    #     Returns: List[(i_local, j_global_row)]
-    #     """
-    #     matches: list[tuple[int, int]] = []
-    #     ivf = self.descmap_index  # KMeansIVF object
-    #     for i, d1 in enumerate(local_descs):
-    #         # candidates_for_query with max_cands=None -> no cap; dedup=True is fine since map_id == row index
-    #         cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
-    #         if not cand_rows:
-    #             matches.append((i, -1))
-    #             continue
-    #         C = self.descmap[cand_rows]  # (K,64)
-    #         scores = self._score_tol_nonzero(d1, C, tol=0.2)
-    #         best_k = int(np.argmax(scores))
-    #         matches.append((i, int(cand_rows[best_k])))
-    #     return matches
     
     def matcher(self, local_descs: np.ndarray, current_pose_w: np.ndarray, search_radius: float = 20.0):
         matches: list[tuple[int, int]] = []
