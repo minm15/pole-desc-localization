@@ -391,7 +391,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     min_y = float(descxy[:, 1].min())
     max_y = float(descxy[:, 1].max())
     
-    GRID_SIZE_METERS = 5.0
+    GRID_SIZE_METERS = 8.0
 
     R = max(max_x - min_x, max_y - min_y)  # shared span (meters)
     dynamic_max = int(np.ceil(R / GRID_SIZE_METERS))
@@ -455,14 +455,12 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
         ivf.nprobe = ivf_nprobe        
     build_stats = ivf.build(desc_source, map_ids=map_ids)
     
-    # === 新增: 初始化 Profiler 並分析 Bucket 分佈 (在 ivf.build 之後) ===
     profiler = analysis_util.IVFProfiler(
         ivf_object=ivf, 
         save_dir=os.path.join(session.dir, "profiling"), 
-        nprobe=ivf.nprobe  # 確保傳入正確的 nprobe
+        nprobe=ivf.nprobe 
     )
     profiler.analyze_bucket_distribution() 
-    # ===============================================================
     
     print("[IVF] build stats:", build_stats)
     descmap_index, edges = ivf, None
@@ -568,7 +566,6 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                         filter.update_measurement(desc, polepos_r_now[:2].T)
                         t_end = time.perf_counter()
                         
-                        # === 新增: 監控並記錄慢速 Frame ===
                         t_elapsed = t_end - t_start
                         # profiler.monitor_frame(
                         #     t_elapsed_sec=t_elapsed, 
@@ -576,7 +573,6 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                         #     frame_idx=i, 
                         #     t_now=t_now
                         # )
-                        # ================================
                         
                         # insert the time data
                         measurement_update_times.append(t_elapsed)

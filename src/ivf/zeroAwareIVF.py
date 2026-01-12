@@ -9,7 +9,7 @@ import numpy as np
 desc_dim = 64
 
 
-# -------- helpers --------
+# -------- helpers (same semantics as your original) --------
 def _to_presence_bits(descs: np.ndarray) -> np.ndarray:
     """
     Return binary presence bits for (N,64) uint8 descriptors:
@@ -22,7 +22,15 @@ def _to_presence_bits(descs: np.ndarray) -> np.ndarray:
 def _idf_weights(bits01: np.ndarray, smooth: float = 0.5) -> np.ndarray:
     """
     Compute simple IDF-like weights per dimension.
+
     IDF(d) = log( (N + 1) / (df_d + smooth) ) , clamped at >= 0.
+
+    Args:
+        bits01: (N,64) presence matrix in {0,1}
+        smooth: small constant to avoid division by zero
+
+    Returns:
+        (64,) float32 array of per-dimension weights
     """
     N = float(bits01.shape[0])
     df = bits01.sum(axis=0).astype(np.float64)
@@ -36,6 +44,12 @@ def _nonzero_unitvar_scale(X: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     Per-dimension scale computed from non-zero values:
         scale[d] = 1 / std(X[ X[:,d]!=0, d ])
     If a dimension has <2 non-zero samples, fall back to 1.0.
+
+    Args:
+        X: (N,64) float array
+
+    Returns:
+        (64,) float32 array of per-dimension scales
     """
     assert X.ndim == 2 and X.shape[1] == desc_dim
     stds = np.zeros(desc_dim, dtype=np.float32)
@@ -50,20 +64,22 @@ def _nonzero_unitvar_scale(X: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return (1.0 / stds).astype(np.float32)
 
 
-def _l2_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """
-    L2 normalize each row of X inplace.
-    This projects vectors onto the unit sphere.
-    """
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    # avoid division by zero
-    norms[norms < eps] = 1.0
-    return X / norms
-
-
 def _kmeans_l2_numpy(X: np.ndarray, k: int, niter: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Minimal L2 k-means fallback (no FAISS).
+    Minimal L2 k-means fallback (no FAISS):
+    - k-means++ initialization
+    - Lloyd iterations
+    - reseed empty clusters
+
+    Args:
+        X: (N,D) float32 matrix
+        k: number of centroids
+        niter: number of iterations
+        seed: RNG seed
+
+    Returns:
+        centroids: (k,D) float32
+        labels:    (N,)  int32
     """
     rng = np.random.RandomState(seed)
     N, D = X.shape
@@ -104,45 +120,72 @@ def _kmeans_l2_numpy(X: np.ndarray, k: int, niter: int, seed: int) -> Tuple[np.n
 class ZeroAwareIVF:
     """
     IVF over an augmented (value + presence) space; drop-in replacement for KMeansIVF.
-    
-    Current Logic:
-    1. Scaling: Enabled (_nonzero_unitvar_scale) to balance dimensions.
-    2. Augmentation: Combine Value + Presence.
-    3. Normalization: Enabled (_l2_normalize_rows) to balance vector magnitudes (fix large buckets).
+
+    Augmentation (per dimension d):
+        - value feature:    v_d_norm  = v_d * (1/std_nonzero_d)
+        - presence feature: z_d       = 1[v_d != 0]
+        - per-dim weight:   w_d = IDF(bits)  (optional)
+        - concatenated vector:
+              [ alpha * w_d * v_d_norm ,  beta * w_d * z_d ]  in R^(2*64=128)
+
+    Intuition:
+        - Presence mismatches receive an explicit penalty via beta * w_d.
+        - When both sides are non-zero, distance is driven by value difference,
+          making 0.2 vs 0.1 much closer than 0.1 vs 0.
+
+    Interface compatibility with KMeansIVF:
+        - Attributes: nlist, nprobe, seed, niter
+        - Methods: build, candidates_for_query, match_within_lists_equal_nonzero,
+                   build_stats, centroids_bits, assigned_list_ids
     """
 
     def __init__(self, outdir: Optional[Path] = None):
-        # Public knobs
+        # Public knobs (compatible names)
         self.nlist: int = 128
         self.nprobe: int = 4
         self.seed: int = 2025
         self.niter: int = 20
 
-        # Weights
-        self.alpha_value: float = 1.0   
-        self.beta_presence: float = 3.0 
-        self.use_idf: bool = True       
+        # Additional weights (tunable)
+        self.alpha_value: float = 1.0   # weight for value differences
+        self.beta_presence: float = 5.0 # penalty for presence mismatch
+        self.use_idf: bool = True       # apply per-dimension IDF weights
 
         self.outdir = Path(outdir) if outdir is not None else None
 
         # Internal state
-        self._map_descs: Optional[np.ndarray] = None
-        self._valid_mask: Optional[np.ndarray] = None
-        self._orig_idx_kept: Optional[np.ndarray] = None
+        self._map_descs: Optional[np.ndarray] = None           # (N,64) uint8
+        self._valid_mask: Optional[np.ndarray] = None          # (N,) bool
+        self._orig_idx_kept: Optional[np.ndarray] = None       # (N_kept,)
         self._rows_by_mapid: Dict[int, List[int]] = {}
-        self._lists: Dict[int, List[Tuple[int, int]]] = {}
+        self._lists: Dict[int, List[Tuple[int, int]]] = {}     # lid -> [(map_id, row_idx), ...]
 
-        # Transforms
-        self._val_scale: Optional[np.ndarray] = None
-        self._idf_w: Optional[np.ndarray] = None
-        self._aug_centroids: Optional[np.ndarray] = None
-        self._labels_kept: Optional[np.ndarray] = None
+        # Transforms / scales
+        self._val_scale: Optional[np.ndarray] = None           # (64,) value scaling
+        self._idf_w: Optional[np.ndarray] = None               # (64,) IDF weights
+        self._aug_centroids: Optional[np.ndarray] = None       # (K,128) centroids
+        self._labels_kept: Optional[np.ndarray] = None         # (N_kept,) list ids
         self._build_stats: Dict[str, object] = {}
 
     # ------------- public API -------------
     def build(self, map_descs: np.ndarray, map_ids: Optional[np.ndarray] = None) -> Dict[str, object]:
         """
         Build IVF index over augmented (value+presence) space.
+
+        Steps:
+          1) Filter out all-zero descriptors.
+          2) Compute per-dim value scale from non-zero values.
+          3) Compute per-dim IDF weights (optional).
+          4) Build augmented vectors: concat( alpha*w*v_norm , beta*w*z ).
+          5) Train k-means centroids in augmented space (FAISS if available; numpy fallback).
+          6) Assign each kept row to its nearest centroid and build inverted lists.
+
+        Args:
+            map_descs: (N,64) uint8 descriptor matrix.
+            map_ids  : (N,) int64 ids; if None, use row indices.
+
+        Returns:
+            dict with basic build statistics.
         """
         assert map_descs.ndim == 2 and map_descs.shape[1] == desc_dim, "map_descs must be (N,64)"
         self._map_descs = map_descs
@@ -165,8 +208,7 @@ class ZeroAwareIVF:
         X = map_descs[kept].astype(np.float32)                 # (Nk,64)
         Z = _to_presence_bits(map_descs[kept]).astype(np.float32)  # (Nk,64)
 
-        # 1. Scaling (Value Part)
-        # Keeps dimensions balanced before augmentation
+        # Per-dimension scaling from non-zero stats
         self._val_scale = _nonzero_unitvar_scale(X)            # (64,)
         Xn = X * self._val_scale[None, :]
 
@@ -179,17 +221,13 @@ class ZeroAwareIVF:
         Wv = (self.alpha_value * self._idf_w)[None, :]         # (1,64)
         Wz = (self.beta_presence * self._idf_w)[None, :]       # (1,64)
 
-        # 2. Augmentation
+        # Augmented vectors: concat(value, presence)
         Xa = np.concatenate([Wv * Xn, Wz * Z], axis=1).astype(np.float32)  # (Nk,128)
-
-        # 3. [New] Global L2 Normalization
-        # Projects all 128-d vectors to unit sphere
-        Xa = _l2_normalize_rows(Xa)
 
         # Use K = min(nlist, Nk)
         K = min(self.nlist, max(1, Xa.shape[0]))
 
-        # Train in augmented space
+        # Train in augmented space (prefer FAISS; fallback to numpy)
         try:
             import faiss  # type: ignore
             d = Xa.shape[1]
@@ -240,7 +278,17 @@ class ZeroAwareIVF:
         expand_if_empty: bool = True,
     ) -> List[int]:
         """
-        Probe top-nprobe augmented-space centroids for a single query.
+        Probe top-nprobe augmented-space centroids for a single query,
+        then collect candidate map_ids from corresponding inverted lists.
+
+        Args:
+            q_desc        : (64,) uint8 query descriptor
+            max_cands     : optional cap of returned candidate count
+            dedup         : if True, stable-unique map_ids
+            expand_if_empty: if True and no probed lists contain entries, scan all lists
+
+        Returns:
+            List[int] of candidate map_ids (deduped if requested)
         """
         assert q_desc.ndim == 1 and q_desc.shape[0] == desc_dim and q_desc.dtype == np.uint8, \
             "q_desc must be (64,) uint8"
@@ -248,19 +296,12 @@ class ZeroAwareIVF:
 
         qv = q_desc.astype(np.float32)
         qz = (qv != 0).astype(np.float32)
-        
-        # 1. Apply Scaling
-        qv *= self._val_scale
+        qv *= self._val_scale  # normalize values
 
         q_aug = np.concatenate([
             (self.alpha_value * self._idf_w) * qv,
             (self.beta_presence * self._idf_w) * qz
         ], axis=0).astype(np.float32)  # (128,)
-
-        # 2. [New] Apply Normalization
-        q_norm = np.linalg.norm(q_aug)
-        if q_norm > 1e-12:
-            q_aug /= q_norm
 
         C = self._aug_centroids  # (K,128)
         d2 = ((C - q_aug[None, :]) ** 2).sum(axis=1)  # (K,)
@@ -298,7 +339,13 @@ class ZeroAwareIVF:
         expand_if_empty: bool = True,
     ) -> Tuple[int, int]:
         """
-        Compatibility helper.
+        Compatibility helper: pick a single best map_id inside probed lists
+        using "equal & non-zero" score (same semantics as your KMeansIVF helper).
+
+        score = sum( (map_desc == q_desc) & (map_desc != 0) )
+
+        Returns:
+            (best_map_id, candidate_count); (-1, 0) if none
         """
         assert self._map_descs is not None, "Map descriptors not stored"
         mids = self.candidates_for_query(
@@ -332,7 +379,8 @@ class ZeroAwareIVF:
 
     def centroids_bits(self) -> Optional[np.ndarray]:
         """
-        Return a rough presence visualization of centroids for compatibility.
+        Return a rough presence visualization of centroids for compatibility:
+        take the presence half (last 64 dims) and threshold at >0.
         """
         if self._aug_centroids is None:
             return None

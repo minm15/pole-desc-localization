@@ -43,54 +43,50 @@ class particlefilter:
     def update_measurement(self, desc, poleparams, resample=True):
         est_pose = self.estimate_pose()
         matches = self.matcher_quant(desc, est_pose) if self.quant else self.matcher(desc, est_pose)
-        # matches = self.matcher_quant(desc) if self.quant else self.matcher(desc)
-        M = poleparams.shape[0]
-        polepos_r = np.hstack([poleparams[:, :2], np.zeros([M, 1]), np.ones([M, 1])]).T
         
-        # update weight according to the matching result
-        local_idx  = np.array([i for i, _ in matches], dtype=int)       # shape (M,)
-        global_idx = np.array([j for _, j in matches], dtype=int)       # shape (M,)
+        valid_matches = [(l_idx, g_list) for l_idx, g_list in matches if len(g_list) > 0]
+        
+        if not valid_matches:
+            return
 
-        # construct the subset of polepos_r, only keep the matched pole
-        polepos_r_sub = polepos_r[:, local_idx]                         # shape (4, M)
-
-        # construct the subset of global descxy
-        desc_sub = self.descxy[global_idx, :2]                           # shape (M, 2)
-
-        # for each particle, perform matrix operation once, (count, 4, M)
-        # represents the pole (4, M) for each particle (count)
+        M_valid = len(valid_matches)
+        local_indices = [m[0] for m in valid_matches]
+        M_all = poleparams.shape[0]
+        polepos_r = np.hstack([poleparams[:, :2], np.zeros([M_all, 1]), np.ones([M_all, 1])]).T
+        
+        polepos_r_sub = polepos_r[:, local_indices]
         polepos_w_all = np.einsum('pij,jk->pik', self.particles, polepos_r_sub)
+        max_k = max(len(m[1]) for m in valid_matches)
+        
+        candidate_pos = np.full((M_valid, max_k, 2), np.inf)
+        
+        for i, (_, g_list) in enumerate(valid_matches):
+            k = len(g_list)
+            candidate_pos[i, :k, :] = self.descxy[g_list, :2]
+        
+        P_xy = polepos_w_all[:, :2, :].transpose(0, 2, 1)[:, :, np.newaxis, :] # (N, M, 1, 2)
+        C_xy = candidate_pos[np.newaxis, :, :, :]                              # (1, M, K, 2)
 
-        # calclate the distance: (count, M)
-        diffs = polepos_w_all[:, :2, :] - desc_sub.T[None, :, :]         # broadcast → (count, 2, M)
-        dists = np.linalg.norm(diffs, axis=1)                            # (count, M)
-        dists = np.minimum(dists, self.d_max)  
-        #print('dist: \n', dists[0])
-
-        weights_factor = np.prod(self.poledist.pdf(dists) + 0.2, axis=1) # shape (count,)
+        dists_all_k = np.linalg.norm(P_xy - C_xy, axis=3)
+        min_dists = np.min(dists_all_k, axis=2)
+        
+        min_dists = np.minimum(min_dists, self.d_max)
+        
+        weights_factor = np.prod(self.poledist.pdf(min_dists) + 0.2, axis=1) # (N,)
 
         self.weights *= weights_factor
         
-        self.weights /= np.sum(self.weights)
+        # Normalize weights
+        w_sum = np.sum(self.weights)
+        if w_sum > 0:
+            self.weights /= w_sum
+        else:
+            self.weights[:] = 1.0 / len(self.weights)
+
         if resample and self.neff < self.minneff:
             self.resample()
             
-    def update_measurement_knn(self, poleparams, resample=True):
-        n = poleparams.shape[0]
-        polepos_r = np.hstack(
-            [poleparams[:, :2], np.zeros([n, 1]), np.ones([n, 1])]).T
-        for i in range(self.count):
-            polepos_w = self.particles[i].dot(polepos_r)
-            d, _ = self.kdtree.query(
-                polepos_w[:2].T, k=1, distance_upper_bound=1.0)
-            #print('dist: ', d)
-            self.weights[i] *= np.prod(
-                self.poledist.pdf(np.clip(d, 0.0, 1.0)) + 0.2)
-        self.weights /= np.sum(self.weights)
-
-        if resample and self.neff < self.minneff:
-            self.resample()
-
+            
     def estimate_pose(self):
         if self.estimatetype == 'mean':
             xyp = util.ht2xyp(np.matmul(self.T_o_w, self.particles))
@@ -173,8 +169,10 @@ class particlefilter:
 
 
     def matcher_quant(self, local_descs: np.ndarray, current_pose_w: np.ndarray, search_radius: float = 20.0):
-        matches: list[tuple[int, int]] = []
+        # Return type changed to list of (int, list[int])
+        matches: list[tuple[int, list[int]]] = []
         ivf = self.descmap_index
+        top_k = 3
 
         min_x, min_y, R = self.geo_qparams
         rx, ry = current_pose_w[0, 3], current_pose_w[1, 3]
@@ -183,7 +181,7 @@ class particlefilter:
         for i, d1 in enumerate(local_descs):
             cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
             if not cand_rows:
-                matches.append((i, -1))
+                matches.append((i, [])) # No candidates -> empty list
                 continue
 
             cand_indices = np.array(cand_rows, dtype=np.int32)
@@ -196,13 +194,20 @@ class particlefilter:
             valid_cands = cand_indices[geo_mask]
 
             if len(valid_cands) == 0:
-                matches.append((i, -1))
+                matches.append((i, []))
                 continue
 
             # --- scoring ---
-            C = self.descmap[valid_cands]  # (K,64)
+            C = self.descmap[valid_cands]  # (N_valid, 64)
             scores = self._score_equal_nonzero(d1, C)
-            best_k = int(np.argmax(scores))
-            matches.append((i, int(valid_cands[best_k])))
+            
+            # --- Top K Selection ---
+            k_current = min(len(scores), top_k)
+            
+            best_local_indices = np.argsort(-scores)[:k_current]
+            
+            best_global_indices = valid_cands[best_local_indices].tolist()
+            
+            matches.append((i, best_global_indices))
 
         return matches
