@@ -27,15 +27,11 @@ class BaselineStandardL2:
         self.desc_dim = D
         if map_ids is None: map_ids = np.arange(N, dtype=np.int64)
 
-        # --- Standard K-Means Training (FAISS) ---
-        # 使用 FAISS 直接進行訓練
         kmeans = faiss.Kmeans(D, self.nlist, niter=self.niter, seed=self.seed, verbose=False)
         X_float = map_descs.astype(np.float32)
         kmeans.train(X_float)
         self.centroids = kmeans.centroids
 
-        # --- Assign Buckets ---
-        # 使用 FAISS 內建的 index 進行 search (比 scipy cdist 快很多)
         _, labels = kmeans.index.search(X_float, 1)
         labels = labels.flatten()
 
@@ -54,14 +50,12 @@ class BaselineStandardL2:
         }
 
     def candidates_for_query(self, q_desc: np.ndarray, max_cands=None, dedup=True, expand_if_empty=True) -> List[int]:
-        # 1. Find nearest centroids (L2) using Scipy (fast enough for single query)
-        # 也可以轉成 faiss search，但在 pure python loop 裡這樣寫 overhead 較小
         dists = scipy.spatial.distance.cdist(q_desc[None, :], self.centroids, metric='euclidean')[0]
         
-        # 2. Get top nprobe buckets
+        # Get top nprobe buckets
         nearest_buckets = np.argsort(dists)[:self.nprobe]
         
-        # 3. Collect candidates
+        # Collect candidates
         candidates = []
         for bid in nearest_buckets:
             candidates.extend([mid for mid, _ in self._lists[bid]])

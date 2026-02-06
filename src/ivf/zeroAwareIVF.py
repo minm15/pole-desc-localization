@@ -1,6 +1,3 @@
-# ===============================
-# ZeroAwareIVF: value+presence gated IVF (drop-in for KMeansIVF)
-# ===============================
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -118,27 +115,6 @@ def _kmeans_l2_numpy(X: np.ndarray, k: int, niter: int, seed: int) -> Tuple[np.n
 
 
 class ZeroAwareIVF:
-    """
-    IVF over an augmented (value + presence) space; drop-in replacement for KMeansIVF.
-
-    Augmentation (per dimension d):
-        - value feature:    v_d_norm  = v_d * (1/std_nonzero_d)
-        - presence feature: z_d       = 1[v_d != 0]
-        - per-dim weight:   w_d = IDF(bits)  (optional)
-        - concatenated vector:
-              [ alpha * w_d * v_d_norm ,  beta * w_d * z_d ]  in R^(2*64=128)
-
-    Intuition:
-        - Presence mismatches receive an explicit penalty via beta * w_d.
-        - When both sides are non-zero, distance is driven by value difference,
-          making 0.2 vs 0.1 much closer than 0.1 vs 0.
-
-    Interface compatibility with KMeansIVF:
-        - Attributes: nlist, nprobe, seed, niter
-        - Methods: build, candidates_for_query, match_within_lists_equal_nonzero,
-                   build_stats, centroids_bits, assigned_list_ids
-    """
-
     def __init__(self, outdir: Optional[Path] = None):
         # Public knobs (compatible names)
         self.nlist: int = 128
@@ -167,26 +143,7 @@ class ZeroAwareIVF:
         self._labels_kept: Optional[np.ndarray] = None         # (N_kept,) list ids
         self._build_stats: Dict[str, object] = {}
 
-    # ------------- public API -------------
     def build(self, map_descs: np.ndarray, map_ids: Optional[np.ndarray] = None) -> Dict[str, object]:
-        """
-        Build IVF index over augmented (value+presence) space.
-
-        Steps:
-          1) Filter out all-zero descriptors.
-          2) Compute per-dim value scale from non-zero values.
-          3) Compute per-dim IDF weights (optional).
-          4) Build augmented vectors: concat( alpha*w*v_norm , beta*w*z ).
-          5) Train k-means centroids in augmented space (FAISS if available; numpy fallback).
-          6) Assign each kept row to its nearest centroid and build inverted lists.
-
-        Args:
-            map_descs: (N,64) uint8 descriptor matrix.
-            map_ids  : (N,) int64 ids; if None, use row indices.
-
-        Returns:
-            dict with basic build statistics.
-        """
         assert map_descs.ndim == 2 and map_descs.shape[1] == desc_dim, "map_descs must be (N,64)"
         self._map_descs = map_descs
         N = map_descs.shape[0]
@@ -274,7 +231,7 @@ class ZeroAwareIVF:
         self,
         q_desc: np.ndarray,
         max_cands: Optional[int] = None,
-        dedup: bool = True,
+        dedup: bool = False,
         expand_if_empty: bool = True,
     ) -> List[int]:
         """

@@ -1,9 +1,0 @@
-[Experiment] Running with ivf_method: baseline_hamming
-session 	 f	e_pos 	rmse_pos 	e_ang 	e_rmse
-2013-01-10 	23.2896146672487 	0.2279015206283509 	0.2819653234707041 	0.7130614724813094 	0.9128742404709074
-[Experiment] Running with ivf_method: baseline_l2
-session 	 f	e_pos 	rmse_pos 	e_ang 	e_rmse
-2013-01-10 	23.2896146672487 	0.2541282667224926 	0.3320045167852085 	0.6638804042347831 	0.8723728037894952
-[Experiment] Running with ivf_method: zeroaware
-session 	 f	e_pos 	rmse_pos 	e_ang 	e_rmse
-2013-01-10 	23.2896146672487 	0.2184500888300352 	0.2745175953436576 	0.6596428912975701 	0.8582227431898666

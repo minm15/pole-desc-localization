@@ -2,6 +2,9 @@ import numpy as np
 import scipy
 import util
 import utils_.feature_utils as feature_utils
+import time
+from scipy.special import logsumexp
+
 
 class particlefilter:
     def __init__(self, count, start, posrange, angrange, 
@@ -42,12 +45,18 @@ class particlefilter:
 
     def update_measurement(self, desc, poleparams, resample=True):
         est_pose = self.estimate_pose()
+        
+        t_match_start = time.perf_counter()
+        
         matches = self.matcher_quant(desc, est_pose) if self.quant else self.matcher(desc, est_pose)
+        
+        t_match_end = time.perf_counter()
+        match_time = t_match_end - t_match_start
         
         valid_matches = [(l_idx, g_list) for l_idx, g_list in matches if len(g_list) > 0]
         
         if not valid_matches:
-            return
+            return match_time
 
         M_valid = len(valid_matches)
         local_indices = [m[0] for m in valid_matches]
@@ -64,19 +73,26 @@ class particlefilter:
             k = len(g_list)
             candidate_pos[i, :k, :] = self.descxy[g_list, :2]
         
-        P_xy = polepos_w_all[:, :2, :].transpose(0, 2, 1)[:, :, np.newaxis, :] # (N, M, 1, 2)
-        C_xy = candidate_pos[np.newaxis, :, :, :]                              # (1, M, K, 2)
+        P_xy = polepos_w_all[:, :2, :].transpose(0, 2, 1)[:, :, np.newaxis, :] 
+        C_xy = candidate_pos[np.newaxis, :, :, :]                              
 
         dists_all_k = np.linalg.norm(P_xy - C_xy, axis=3)
         min_dists = np.min(dists_all_k, axis=2)
         
         min_dists = np.minimum(min_dists, self.d_max)
         
-        weights_factor = np.prod(self.poledist.pdf(min_dists) + 0.2, axis=1) # (N,)
+        likelihoods = self.poledist.pdf(min_dists) + 0.2
+        
+        log_lik = np.log(likelihoods)
+        log_lik_sorted = np.sort(log_lik, axis=1)
+        
+        trim_ratio = 0.5
+        n_keep = int(max(1, M_valid * trim_ratio))
+        
+        weights_factor = np.exp(np.sum(log_lik_sorted[:, -n_keep:], axis=1))
 
         self.weights *= weights_factor
         
-        # Normalize weights
         w_sum = np.sum(self.weights)
         if w_sum > 0:
             self.weights /= w_sum
@@ -85,6 +101,8 @@ class particlefilter:
 
         if resample and self.neff < self.minneff:
             self.resample()
+            
+        return match_time
             
             
     def estimate_pose(self):
@@ -107,7 +125,7 @@ class particlefilter:
     def resample(self):
         cumsum = np.cumsum(self.weights)
         pos = np.random.rand() / self.count
-        idx = np.empty(self.count, dtype=np.int)
+        idx = np.empty(self.count, dtype=np.int64)
         ics = 0
         for i in range(self.count):
             while cumsum[ics] < pos:
@@ -136,13 +154,14 @@ class particlefilter:
         return (eq & nz).sum(axis=1)
     
     def matcher(self, local_descs: np.ndarray, current_pose_w: np.ndarray, search_radius: float = 20.0):
-        matches: list[tuple[int, int]] = []
         ivf = self.descmap_index
+        matches: list[tuple[int, list[int]]] = []
+        top_k = 10
         
         rx, ry = current_pose_w[0, 3], current_pose_w[1, 3]
         
         for i, d1 in enumerate(local_descs):
-            cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
+            cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=False, expand_if_empty=False)
             if not cand_rows:
                 matches.append((i, -1))
                 continue
@@ -156,14 +175,21 @@ class particlefilter:
             valid_cands = cand_indices[valid_mask]
             
             if len(valid_cands) == 0:
-                matches.append((i, -1))
+                matches.append((i, []))
                 continue
-                
-            C = self.descmap[valid_cands]
+            
+            # --- scoring ---
+            C = self.descmap[valid_cands]  # (N_valid, 64)
             scores = self._score_tol_nonzero(d1, C, tol=0.2)
-            best_idx_in_subset = int(np.argmax(scores))
-
-            matches.append((i, int(valid_cands[best_idx_in_subset])))
+            
+            # --- Top K Selection ---
+            k_current = min(len(scores), top_k)
+            
+            best_local_indices = np.argsort(-scores)[:k_current]
+            
+            best_global_indices = valid_cands[best_local_indices].tolist()
+            
+            matches.append((i, best_global_indices))
             
         return matches
 
@@ -172,14 +198,14 @@ class particlefilter:
         # Return type changed to list of (int, list[int])
         matches: list[tuple[int, list[int]]] = []
         ivf = self.descmap_index
-        top_k = 3
+        top_k = 10
 
         min_x, min_y, R = self.geo_qparams
         rx, ry = current_pose_w[0, 3], current_pose_w[1, 3]
         qrx, qry = feature_utils.quantize_xy_to_u6_shared(rx, ry, min_x, min_y, R)
 
         for i, d1 in enumerate(local_descs):
-            cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=True, expand_if_empty=True)
+            cand_rows = ivf.candidates_for_query(d1.astype(np.uint8), max_cands=None, dedup=False, expand_if_empty=False)
             if not cand_rows:
                 matches.append((i, [])) # No candidates -> empty list
                 continue

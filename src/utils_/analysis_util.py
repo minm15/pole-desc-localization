@@ -31,26 +31,21 @@ class IVFProfiler:
     def analyze_bucket_distribution(self):
         """
         Stats: Counts descriptors per bucket (centroid).
-        Handles:
-            1. ZeroAwareIVF (dict: self.ivf._lists)
-            2. Generic/KMeansIVF (list/array: self.ivf.invlists)
-            3. FAISS-wrapped (self.ivf.index.invlists)
+        Saves raw bucket sizes to .npy for external comparison.
         """
         print("[IVFProfiler] Analyzing bucket distribution...")
         
         bucket_sizes = []
         nlist = getattr(self.ivf, 'nlist', 0)
 
-        # --- Case 1: ZeroAwareIVF (uses dictionary _lists) ---
+        # --- Case 1: ZeroAwareIVF ---
         if hasattr(self.ivf, '_lists') and isinstance(self.ivf._lists, dict):
-            # _lists is a dict {centroid_id: [items...]}
-            # We must account for empty buckets (ids from 0 to nlist-1)
             bucket_sizes = [0] * nlist
             for lid, items in self.ivf._lists.items():
                 if 0 <= lid < nlist:
                     bucket_sizes[lid] = len(items)
         
-        # --- Case 2: Generic list of lists (KMeansIVF) ---
+        # --- Case 2: Generic list of lists ---
         elif hasattr(self.ivf, 'invlists') and isinstance(self.ivf.invlists, (list, np.ndarray)):
             bucket_sizes = [len(l) for l in self.ivf.invlists]
         
@@ -60,55 +55,34 @@ class IVFProfiler:
             bucket_sizes = [self.ivf.index.invlists.list_size(i) for i in range(nlist)]
         
         else:
-            print("[IVFProfiler] Error: Cannot access internal lists to count bucket sizes.")
-            print(f"Object dir: {dir(self.ivf)}")
+            print("[IVFProfiler] Error: Cannot access internal lists.")
             return
 
         bucket_sizes = np.array(bucket_sizes)
-        # Verify we have data
         if len(bucket_sizes) == 0:
             print("[IVFProfiler] Warning: nlist is 0 or buckets are empty.")
             return
 
-        n_buckets = len(bucket_sizes)
-        total_descs = np.sum(bucket_sizes)
-        
         stats = {
-            "total_buckets": int(n_buckets),
-            "total_descriptors": int(total_descs),
-            "min_size": int(np.min(bucket_sizes)),
-            "max_size": int(np.max(bucket_sizes)),
             "mean_size": float(np.mean(bucket_sizes)),
             "std_dev": float(np.std(bucket_sizes)),
+            "max_size": int(np.max(bucket_sizes)),
             "empty_buckets": int(np.sum(bucket_sizes == 0))
         }
-        
         print(f"[IVFProfiler] Stats: {json.dumps(stats, indent=2)}")
 
-        # Plot Histogram
+        n_buckets = len(bucket_sizes)
         plt.figure(figsize=(10, 6))
         plt.bar(range(n_buckets), bucket_sizes, width=1.0, color='skyblue', edgecolor='black', linewidth=0.5)
-        plt.title(f"IVF Bucket Size Distribution (Total: {total_descs})")
-        plt.xlabel("Bucket ID (Centroid Index)")
-        plt.ylabel("Number of Descriptors")
+        plt.title(f"IVF Bucket Size Distribution (Total: {np.sum(bucket_sizes)})")
         plt.axhline(y=stats['mean_size'], color='r', linestyle='--', label=f"Mean: {stats['mean_size']:.1f}")
         plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        plot_path = os.path.join(self.save_dir, "ivf_bucket_distribution.png")
-        plt.savefig(plot_path)
+        plt.savefig(os.path.join(self.save_dir, "ivf_bucket_histogram.png"))
         plt.close()
-        print(f"[IVFProfiler] Distribution plot saved to {plot_path}")
 
-        # Save Stats
-        top_indices = np.argsort(bucket_sizes)[::-1][:20]
-        top_buckets = [{"id": int(i), "size": int(bucket_sizes[i])} for i in top_indices]
-        
-        with open(os.path.join(self.save_dir, "ivf_stats.json"), 'w') as f:
-            json.dump({"stats": stats, "top_large_buckets": top_buckets}, f, indent=4)
-
-        # Store bucket_sizes for query profiling
-        self.cached_bucket_sizes = bucket_sizes
+        raw_data_path = os.path.join(self.save_dir, "bucket_sizes.npy")
+        np.save(raw_data_path, bucket_sizes)
+        print(f"[IVFProfiler] Raw bucket data saved to: {raw_data_path}")
 
     def monitor_frame(self, t_elapsed_sec, query_descs, frame_idx, t_now):
         """

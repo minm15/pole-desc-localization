@@ -34,6 +34,7 @@ parser.add_argument('--n_mapdetections', type=int, default=5, help='number of ma
 parser.add_argument('--mapinterval', type=float, default=0.25, help='mapinterval')
 parser.add_argument('--n_locdetections', type=int, default=1, help='n_locdetections')
 parser.add_argument('--desc_dim', type=int, default=64, help='descriptor dimension (default: 64)')
+parser.add_argument('--pf', type=int, default=1000, help='the number of particle (default: 1000)')
 parser.add_argument('--eval_out', type=str, default=None, help='path to save evaluation summary (default: stdout)')
 parser.add_argument('--mode', type=str, default='full',
                     choices=['full', 'build_map', 'localize'],
@@ -47,13 +48,17 @@ parser.add_argument('--session_end', type=int, default=len(pynclt.sessions),
 parser.add_argument('--ivf_method', type=str, default='zeroaware',
                     choices=['kmeans', 'zeroaware', 'baseline_l2', 'baseline_hamming'],
                     help='Choose IVF backend: kmeans (presence-only) or zeroaware (value+presence)')
+parser.add_argument('--quant_method', type=str, default='uniform',
+                    choices=['uniform', 'frequency', 'zscore'],
+                    help='Choose quantization method')
+
 args = parser.parse_args()
 
 # Load Model
 model = SalsaNext(2)
 filename = './model/PoleNet'
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-w_dict = torch.load(filename, map_location=lambda storage, loc: storage)
+w_dict = torch.load(filename, map_location=lambda storage, loc: storage, weights_only=False)
 model.load_state_dict(w_dict['state_dict'], strict=True)
 print('Model loaded from %s.' % filename)
 model.to(device)
@@ -65,7 +70,7 @@ mapsize = np.full(3, 0.2)
 mapshape = np.array(mapextent / mapsize, dtype=int)
 mapinterval = args.mapinterval
 mapdistance = mapinterval
-remapdistance = 10.0
+remapdistance = 1.0
 n_mapdetections = args.n_mapdetections
 n_locdetections = args.n_locdetections
 n_localmaps = n_mapdetections
@@ -201,9 +206,9 @@ def save_global_map_position():
 
 def save_global_map():
     target_sessions = pynclt.sessions[args.session_start:args.session_end]
-    POS_MATCH_THRESHOLD_METERS = 8.0
+    POS_MATCH_THRESHOLD_METERS = 10.0
     DESC_SCORE_TOLERANCE = 0.2
-    DESC_MIN_SCORE_THRESHOLD = 3
+    DESC_MIN_SCORE_THRESHOLD = 2
 
     global_clustermeans = np.empty([0, 3])
     global_clusterdescs = np.empty((0, desc_dim))
@@ -319,10 +324,10 @@ def save_local_maps(sessionname, visualize=False):
     all_descs = []
     
     detection_times_ms = []
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
 
     def plot_timing_analysis(times, save_dir):
+        if not times:
+            return
         plt.figure(figsize=(10, 6))
         plt.plot(times, linestyle='-', color='b', linewidth=1, alpha=0.8)
         plt.title(f"Detection Latency Analysis ({sessionname})")
@@ -341,7 +346,7 @@ def save_local_maps(sessionname, visualize=False):
 
     with progressbar.ProgressBar(max_value=len(iend)) as bar:
         for i in range(len(iend)):
-            # Pre-processing
+            # --- Pre-processing ---
             T_w_mc = util.project_xy(session.T_w_r_odo_velo[imid[i]].dot(T_r_mc))
             T_w_m = T_w_mc.dot(T_mc_m)
             T_m_w = util.invert_ht(T_w_m)
@@ -352,10 +357,23 @@ def save_local_maps(sessionname, visualize=False):
 
             iscan = imid[i]
             xyz, _ = session.get_velo(iscan)
+                        
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             
-            t0 = time.perf_counter_ns()
+            t_start = time.perf_counter()
+            
             poleparams, desc = poles_extractor.detect_poles_learning(
                 xyz, model, device, cut_z=False, desc_dim=desc_dim, desc=True, vis=False)
+            
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            t_end = time.perf_counter()
+            dt_ms = (t_end - t_start) * 1000.0
+            detection_times_ms.append(dt_ms)
+            
+
             all_descs.append(desc)
                 
             localpoleparam_xy = poleparams[:, :2]
@@ -372,6 +390,7 @@ def save_local_maps(sessionname, visualize=False):
             
     if detection_times_ms:
         plot_timing_analysis(detection_times_ms, session.dir)
+        print(f"Average Inference Time: {np.mean(detection_times_ms):.2f} ms")
     
     np.savez(os.path.join(session.dir, get_localmapfile()), maps=maps)
 
@@ -410,8 +429,15 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
         descxy_u8 = feature_utils.quantize_xy_array_to_u6_shared(descxy, min_x, min_y, R)
     
     qmap, thresholds = [], []
+    
     if quant:
-        qmap, thresholds = feature_utils.quantize_descmap(descmap, bits=quant_bits)
+        print("quant_method:", quant_method)
+        if quant_method == "frequency":    
+            qmap, thresholds = feature_utils.quantize_descmap(descmap, bits=quant_bits)
+        elif quant_method == "zscore": 
+            qmap, thresholds = feature_utils.quantize_descmap_zscore(descmap, bits=quant_bits)
+        else:
+            qmap, thresholds = feature_utils.quantize_descmap_uniform(descmap, bits=quant_bits)
     
     print(f"descmap size: {descmap.shape}, descxy size: {descxy.shape}")
     if quant: print([f"{t:.10f}" for t in thresholds])
@@ -481,7 +507,8 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
         )
         print("[export] map.json ->", map_json)
     
-    filter = particlefilter.particlefilter(10000, 
+    print("[pf]:", pf)
+    filter = particlefilter.particlefilter(pf, 
         T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, 
         descxy_u8=descxy_u8, geo_qparams=geo_qparams, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
@@ -513,9 +540,11 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     T = session.t_relodo.size
     n_active_per_step = np.zeros(T, dtype=np.int32)
     measurement_update_times = []
+    match_times = []  # 新增
+    mcl_times = []    # 新增
 
     with progressbar.ProgressBar(max_value=session.t_relodo.size) as bar:
-        for i in range(istart, session.t_relodo.size):
+        for i in range(istart, session.t_relodo.size):            
             relodocov = np.empty([3, 3])
             relodocov[:2, :2] = session.relodocov[i, :2, :2]
             relodocov[:, 2] = session.relodocov[i, [0, 1, 5], 5]
@@ -563,31 +592,41 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
 
                         # time profiling
                         t_start = time.perf_counter()
-                        filter.update_measurement(desc, polepos_r_now[:2].T)
+                        match_t = filter.update_measurement(desc, polepos_r_now[:2].T)
                         t_end = time.perf_counter()
                         
                         t_elapsed = t_end - t_start
-                        # profiler.monitor_frame(
-                        #     t_elapsed_sec=t_elapsed, 
-                        #     query_descs=desc, 
-                        #     frame_idx=i, 
-                        #     t_now=t_now
-                        # )
+                        
+                        if match_t is None: match_t = 0.0 
+                        mcl_t = t_elapsed - match_t
                         
                         # insert the time data
                         measurement_update_times.append(t_elapsed)
+                        match_times.append(match_t)
+                        mcl_times.append(mcl_t)
+                        
                         T_w_r_est[i] = filter.estimate_pose()
-
+                        
                     imap += 1
             bar.update(i)
 
     if quant: qwriter.close() # close query writer
-    plot_filename = f"perf_update_measurement_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    plot_path = os.path.join(session.dir, plot_filename)
-    plot_util.save_performance_plot(measurement_update_times, plot_path)
+    # plot_filename = f"perf_update_measurement_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    # plot_path = os.path.join(session.dir, plot_filename)
+    # plot_util.save_performance_plot(measurement_update_times, plot_path)
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))
-    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object))
+    
+    ts_arr = np.array(measurement_update_times)
+    if ts_arr.size > 0:
+        t_mean = np.mean(ts_arr)
+        t_max = np.max(ts_arr)
+    else:
+        t_mean = 0.0
+        t_max = 0.0    
+    
+    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object), 
+             meas_time_mean=t_mean, meas_time_max=t_max, match_time_mean=np.mean(match_times), mcl_time_mean=np.mean(mcl_times))
     print('append_count', append_count)
 
 def evaluate(output_path=args.eval_out):
@@ -603,10 +642,26 @@ def evaluate(output_path=args.eval_out):
         T_w_r_gt = np.stack([util.project_xy(session.get_T_w_r_gt(t).dot(T_r_mc)).dot(T_mc_r) for t in t_eval])
 
         T_gt_est = []
+        session_time_means = []
+        session_time_maxs = []
+        
+        session_match_means = []
+        session_mcl_means = []
+
         for file in files:
             fpath = os.path.join(pynclt.resultdir, sessionname, file)
             data = np.load(fpath)
             T_w_r_est = data['T_w_r_est']
+            
+            t_mean = float(data.get('meas_time_mean', 0.0))
+            t_max = float(data.get('meas_time_max', 0.0))
+            session_time_means.append(t_mean)
+            session_time_maxs.append(t_max)
+            
+            t_match = float(data.get('match_time_mean', 0.0))
+            t_mcl = float(data.get('mcl_time_mean', 0.0))
+            session_match_means.append(t_match)
+            session_mcl_means.append(t_mcl)
             
             T_w_r_est_interp = np.empty([len(t_eval), 4, 4])
             iodo = 1; inum = 0
@@ -621,10 +676,10 @@ def evaluate(output_path=args.eval_out):
             
         T_gt_est = np.stack(T_gt_est) 
         L = T_gt_est.shape[1]
-        t_plot = t_eval[:L]  
+        # t_plot = t_eval[:L]  
 
         poserrors = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)
-        poserror_mean = np.mean(poserrors, axis=0)
+        # poserror_mean = np.mean(poserrors, axis=0)
 
         lonerror = np.mean(np.mean(np.abs(T_gt_est[..., 0, 3]), axis=-1))
         laterror = np.mean(np.mean(np.abs(T_gt_est[..., 1, 3]), axis=-1))
@@ -633,10 +688,20 @@ def evaluate(output_path=args.eval_out):
         angerrors = np.degrees(np.abs(np.array([util.ht2xyp(T)[:, 2] for T in T_gt_est])))
         angerror = np.mean(np.mean(angerrors, axis=-1))
         angrmse = np.mean(np.sqrt(np.mean(angerrors**2, axis=-1)))
-
-        stats.append({'session': sessionname, 'lonerror': lonerror, 
+        
+        avg_time_mean = np.mean(session_time_means) if session_time_means else 0.0
+        avg_time_max = np.max(session_time_maxs) if session_time_maxs else 0.0
+        
+        avg_match_mean = np.mean(session_match_means) if session_match_means else 0.0
+        avg_mcl_mean = np.mean(session_mcl_means) if session_mcl_means else 0.0
+        
+        stats.append({
+            'session': sessionname, 'lonerror': lonerror, 
             'laterror': laterror, 'poserror': poserror, 'posrmse': posrmse,
-            'angerror': angerror, 'angrmse': angrmse, 'T_gt_est': T_gt_est})
+            'angerror': angerror, 'angrmse': angrmse, 'T_gt_est': T_gt_est,
+            'time_mean': avg_time_mean, 'time_max': avg_time_max,
+            'match_mean': avg_match_mean, 'mcl_mean': avg_mcl_mean
+        })
 
     np.savez(os.path.join(pynclt.resultdir, get_evalfile()), stats=stats)
 
@@ -647,8 +712,15 @@ def evaluate(output_path=args.eval_out):
     else:
         out = open(output_path, 'a')
         close_out = True
-    print('session \t f\te_pos \trmse_pos \te_ang \te_rmse', file=out)
-    row = '{session} \t{f} \t{poserror} \t{posrmse} \t{angerror} \t{angrmse}'
+        
+    header = "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>12} {:>12}".format(
+        "session", "f(%)", "e_pos", "rmse_pos", "e_ang", "e_rmse", 
+        "t_match(ms)", "t_mcl(ms)", "t_mean(ms)", "t_max(ms)"
+    )
+    print(header, file=out)
+
+    row = "{session:<12} {f:>10.2f} {poserror:>10.4f} {posrmse:>10.4f} {angerror:>10.4f} {angrmse:>10.4f} {match:>12.4f} {mcl:>12.4f} {t_mean:>12.4f} {t_max:>12.4f}"
+
     for i, stat in enumerate(stats):
         print(row.format(
             session=stat['session'],
@@ -656,7 +728,12 @@ def evaluate(output_path=args.eval_out):
             poserror=stat['poserror'],
             posrmse=stat['posrmse'],
             angerror=stat['angerror'],
-            angrmse=stat['angrmse']),
+            angrmse=stat['angrmse'],
+            match=stat['match_mean'] * 1000.0,
+            mcl=stat['mcl_mean'] * 1000.0,
+            t_mean=stat['time_mean'] * 1000.0, 
+            t_max=stat['time_max'] * 1000.0
+            ),
             file=out)
         
     if close_out:
@@ -673,6 +750,8 @@ if __name__ == '__main__':
     print(f"Quantization enabled? {do_quant}, bits={quant_bits}")
     ivf_nlist = args.nlist
     ivf_nprobe = args.nprobe
+    pf = args.pf
+    quant_method = args.quant_method
     
     target_sessions = pynclt.sessions[args.session_start:args.session_end]
     if args.mode == 'full':
@@ -681,8 +760,8 @@ if __name__ == '__main__':
         #save_global_map_position()
         for session in target_sessions:
             save_local_maps(session)
-            localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
-        evaluate(output_path=args.eval_out)
+            #localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
+        #evaluate(output_path=args.eval_out)
     elif args.mode == 'build_map':
         print(f"[MODE build_map] Only build global map using "
               f"sessions[{args.session_start}:{args.session_end}]")

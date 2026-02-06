@@ -7,11 +7,6 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 import utils_.feature_utils as feature_utils
 
-
-# ---------------------------
-# Binary writers
-# ---------------------------
-
 def write_bin_raw(path: Path, arr: np.ndarray) -> None:
     """Write raw binary only (no metadata)."""
     path = Path(path)
@@ -61,12 +56,8 @@ def extract_ivf_lists_and_centroids(ivf):
     """
     extra: Dict[str, Any] = {}
     
-    # 紀錄 class name 方便在 map.json 辨識是用哪個方法產生的
     extra["ivf_impl"] = ivf.__class__.__name__
 
-    # -------------------------------------------------------
-    # 1. ZeroAwareIVF (Has _aug_centroids and _lists)
-    # -------------------------------------------------------
     if hasattr(ivf, "_aug_centroids") and hasattr(ivf, "_lists"):
         C = getattr(ivf, "_aug_centroids", None)
         lists = getattr(ivf, "_lists", None)
@@ -102,10 +93,6 @@ def extract_ivf_lists_and_centroids(ivf):
         postings_map_ids = np.asarray(all_ids, dtype=np.int32)
         return K, centroids, offsets, postings_map_ids, extra
 
-    # -------------------------------------------------------
-    # 2. Baselines (StandardL2 / BinaryHamming)
-    #    特徵: 有 centroids (numpy) 和 _lists (dict)
-    # -------------------------------------------------------
     if hasattr(ivf, "centroids") and hasattr(ivf, "_lists"):
         centroids = np.asarray(ivf.centroids, dtype=np.float32)
         K = int(centroids.shape[0])
@@ -115,7 +102,6 @@ def extract_ivf_lists_and_centroids(ivf):
         all_ids = []
         cur = 0
         for lid in range(K):
-            # Baseline 的 _lists 結構也是 [(mid, row_idx), ...]
             entries = lists.get(lid, [])
             mids = [int(mid) for (mid, _row) in entries]
             all_ids.extend(mids)
@@ -123,15 +109,9 @@ def extract_ivf_lists_and_centroids(ivf):
             offsets[lid + 1] = cur
         
         postings_map_ids = np.asarray(all_ids, dtype=np.int32)
-        
-        # BinaryHamming 的 centroids 是 float (means)，但在 gem5 裡
-        # 我們一樣用 L2 distance 去算 (作為 soft hamming)，所以不需要額外轉換
+
         return K, centroids, offsets, postings_map_ids, extra
 
-    # -------------------------------------------------------
-    # 3. Generic/Legacy KMeansIVF (best-effort)
-    #    特徵: 有 centroids 和 lists (無底線)
-    # -------------------------------------------------------
     if hasattr(ivf, "centroids"):
         centroids = np.asarray(ivf.centroids, dtype=np.float32)
         K = int(centroids.shape[0])
@@ -141,10 +121,7 @@ def extract_ivf_lists_and_centroids(ivf):
             all_ids = []
             cur = 0
             for lid in range(K):
-                # 假設 legacy lists 直接存 [mid, mid, ...] 或類似結構
-                # 這裡為了保險起見，假設是 list of IDs
                 raw_list = lists.get(lid, [])
-                # 嘗試判斷內容物
                 if raw_list and isinstance(raw_list[0], (tuple, list)):
                      mids = [int(x[0]) for x in raw_list]
                 else:
@@ -164,11 +141,6 @@ def extract_ivf_lists_and_centroids(ivf):
         f"Unsupported IVF object type: {type(ivf)}. "
         "Expected ZeroAwareIVF, BaselineStandardL2, or BaselineBinaryHamming."
     )
-
-
-# ---------------------------
-# MAP export
-# ---------------------------
 
 def export_ivf_map(
     out_dir: str,
@@ -263,11 +235,6 @@ def export_ivf_map(
         json.dump(meta, f, indent=2)
 
     return str(json_path), np.asarray(thresholds)
-
-
-# ---------------------------
-# QUERY export (stream)
-# ---------------------------
 
 class QueryExportWriter:
     """

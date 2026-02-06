@@ -6,9 +6,6 @@ import numpy as np
 
 DESC_DIM = 64
 
-# ===============================
-# Binary / presence helpers
-# ===============================
 def to_presence_bits(descs: np.ndarray) -> np.ndarray:
     """
     Convert (N,64) uint8 descriptors to presence bits in {0,1}:

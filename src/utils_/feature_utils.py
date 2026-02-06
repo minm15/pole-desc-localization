@@ -1,4 +1,5 @@
 import numpy as np
+from sklearn.cluster import KMeans
 
 def score_based_feature_match(new_pole, new_desc, global_poles, global_descs,
                               pos_thresh, score_thresh, score_tol):
@@ -58,7 +59,7 @@ def build_descmap_index(descmap, k):
         descmap_index[bin_idx].append(j)
     return descmap_index, edges
 
-def quantize_descmap(descmap: np.ndarray, bits: int = 6):
+def quantize_descmap(descmap: np.ndarray, bits: int = 4):
     """
     Quantize descriptor map into buckets.
     """
@@ -79,6 +80,183 @@ def quantize_descmap(descmap: np.ndarray, bits: int = 6):
     qflat[nonzero_mask] = qvals
 
     return qflat.reshape(descmap.shape), thresholds
+
+def quantize_descmap_uniform(descmap: np.ndarray, bits: int = 6):
+    """
+    Quantize descriptor map into buckets using uniform intervals.
+    """
+    if bits < 1: raise ValueError("bits must be >= 1")
+    num_buckets = 1 << bits
+    flat = descmap.ravel()
+    nonzero_mask = (flat != 0.0)
+    nonzeros = flat[nonzero_mask]
+
+    if nonzeros.size == 0:
+        return np.zeros_like(descmap, dtype=int), np.array([])
+
+    min_val = nonzeros.min()
+    max_val = nonzeros.max()
+
+    edges = np.linspace(min_val, max_val, num_buckets + 1)
+    thresholds = edges[1:-1]
+
+    idx = np.digitize(nonzeros, thresholds, right=False)
+
+    qvals = idx + 1
+    
+    qflat = np.zeros_like(flat, dtype=int)
+    qflat[nonzero_mask] = qvals
+
+    return qflat.reshape(descmap.shape), thresholds
+
+def quantize_descmap_zscore(descmap: np.ndarray, bits: int = 4, k: float = 3.0):
+    """
+    Return interface unchanged: (qmap, thresholds)
+
+    thresholds: length (2^bits - 2) (e.g. 14 when bits=4),
+    suitable for quantize_descriptor(vec, thresholds) which does:
+        idx = digitize(vec[nz], thresholds); q = idx + 1
+
+    Behavior:
+      - zeros stay 0 in qmap
+      - positives are quantized into 1..(2^bits-1)
+      - tail-high (>U) naturally maps to the highest bin
+      - tail-low (<=L) naturally maps to the lowest nonzero bin (1)
+        (cannot map positives to bin0 without changing quantize_descriptor)
+    """
+    if bits < 2:
+        raise ValueError("bits must be >= 2")
+    B = 1 << bits
+    n_thr = B - 2  # e.g. 14
+
+    flat = descmap.ravel()
+    qflat = np.zeros_like(flat, dtype=int)
+
+    pos_mask = (flat > 0.0)
+    x = flat[pos_mask]
+    if x.size == 0:
+        return qflat.reshape(descmap.shape), np.array([])
+
+    mu = x.mean()
+    sigma = x.std(ddof=0)
+    if sigma == 0.0:
+        qflat[pos_mask] = 1
+        return qflat.reshape(descmap.shape), np.array([])
+
+    L = mu - k * sigma
+    U = mu + k * sigma
+
+    # middle range used to compute quantile thresholds
+    xin = x[(x > L) & (x <= U)]
+    if xin.size == 0:
+        # fallback: quantile over all positives
+        qs = np.linspace(0.0, 1.0, B)[1:-1]  # length B-2
+        thresholds = np.quantile(x, qs).astype(float)
+    else:
+        qs = np.linspace(0.0, 1.0, B)[1:-1]  # length B-2 (14)
+        thresholds = np.quantile(xin, qs).astype(float)
+
+    # make thresholds strictly increasing to reduce empty bins when ties exist
+    eps = np.finfo(float).eps * max(1.0, float(U) if np.isfinite(U) else 1.0)
+    thresholds = np.maximum.accumulate(thresholds)
+    for i in range(1, thresholds.size):
+        if thresholds[i] <= thresholds[i - 1]:
+            thresholds[i] = thresholds[i - 1] + eps
+
+    # quantize positives using these thresholds (same rule as quantize_descriptor)
+    idx = np.digitize(x, thresholds, right=False)  # 0..(B-2)
+    qflat[pos_mask] = idx + 1                      # 1..(B-1)
+
+    return qflat.reshape(descmap.shape), thresholds
+
+# def quantize_descmap_kmeans(descmap: np.ndarray, bits: int = 4, clip_percentile: float = 0.95):
+#     """
+#     Hybrid Strategy: Clipped Log + K-Means.
+    
+#     Why this works:
+#       1. Dedicate the last bin (Bin 15) exclusively to the top (1-clip)% outliers.
+#          This prevents the 'long tail' from stealing centroids from the dense peak.
+#       2. Apply Log + K-Means ONLY on the remaining 99% of data.
+#          This forces high resolution (14 bins) on the dense region where accuracy matters most.
+    
+#     Args:
+#         clip_percentile: e.g., 0.99 means top 1% data goes to the last bin.
+#     """
+#     if bits < 2:
+#         raise ValueError("bits must be >= 2")
+    
+#     B = 1 << bits
+#     n_bins_total = B - 1        # 15 bins (1..15)
+    
+#     flat = descmap.ravel()
+#     qflat = np.zeros_like(flat, dtype=int)
+    
+#     # Filter positives
+#     pos_mask = (flat > 0.0)
+#     x = flat[pos_mask]
+    
+#     if x.size == 0:
+#         return qflat.reshape(descmap.shape), np.array([])
+    
+#     # --- Step 1: Handle the Tail (Clipping) ---
+#     # Find the boundary for the top 1% (or user defined %)
+#     # This value becomes the "Gatekeeper" to the last bin.
+#     tail_threshold = np.quantile(x, clip_percentile)
+    
+#     # Split data: Body (99%) vs Tail (1%)
+#     x_body = x[x <= tail_threshold]
+    
+#     # Check if we have enough unique data in body to do clustering
+#     unique_body = np.unique(x_body)
+    
+#     # We reserve 1 bin for the tail, so we have (n_bins_total - 1) for the body
+#     n_bins_body = n_bins_total - 1  # e.g., 14 bins
+    
+#     final_thresholds = []
+
+#     if unique_body.size <= n_bins_body:
+#         # Fallback if body is too sparse: just use Quantile or unique values
+#         qs = np.linspace(0, 1, n_bins_body + 1)[1:]
+#         body_thresholds = np.quantile(x_body, qs)
+#     else:
+#         # --- Step 2: Log + K-Means on the Body ---
+#         # Log transform focuses resolution on small values
+#         x_body_log = np.log(x_body)
+#         X_train = x_body_log.reshape(-1, 1)
+        
+#         # Run K-Means only on the body
+#         kmeans = KMeans(n_clusters=n_bins_body, n_init=10, random_state=42)
+#         kmeans.fit(X_train)
+        
+#         # Get centroids in Log domain
+#         centroids = np.sort(kmeans.cluster_centers_.flatten())
+        
+#         # Calculate boundaries (midpoints) in Log domain
+#         # These separate bins 1..14
+#         log_bounds = (centroids[:-1] + centroids[1:]) / 2.0
+#         body_thresholds = np.exp(log_bounds)
+    
+#     # --- Step 3: Combine Thresholds ---
+#     # The thresholds are: [Body Boundaries] + [Tail Threshold]
+#     # Body boundaries split bins 1 to 14.
+#     # Tail threshold splits bin 14 from bin 15.
+    
+#     thresholds = np.concatenate([body_thresholds, [tail_threshold]])
+    
+#     # --- Safety: Ensure strictly increasing ---
+#     thresholds = np.maximum.accumulate(thresholds)
+#     eps = np.finfo(float).eps * max(1.0, float(x.max()))
+#     for i in range(1, thresholds.size):
+#         if thresholds[i] <= thresholds[i - 1]:
+#             thresholds[i] = thresholds[i - 1] + eps
+
+#     # --- Quantize ---
+#     # digitize returns 0..14. +1 makes it 1..15
+#     idxs = np.digitize(x, thresholds, right=False)
+#     qflat[pos_mask] = idxs + 1
+    
+#     return qflat.reshape(descmap.shape), thresholds
+
 
 def quantize_descriptor(vec: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
     """

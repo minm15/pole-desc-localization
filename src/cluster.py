@@ -10,7 +10,7 @@ def cluster_boxes(boxes):
             np.all(boxes[i, 2:] >= boxes[i+1:, :2], axis=1)))[0] + i + 1
         if ioverlap.size > 0:
             ebunch = np.stack(
-                [i * np.ones(ioverlap.size, dtype=np.int), ioverlap]).T
+                [i * np.ones(ioverlap.size, dtype=np.int64), ioverlap]).T
             graph.add_edges_from(ebunch)
         else:
             graph.add_node(i)

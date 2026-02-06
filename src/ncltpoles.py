@@ -19,18 +19,43 @@ from ivf.zeroAwareIVF import ZeroAwareIVF
 
 import utils_.feature_utils as feature_utils
 import utils_.report_utils as report_utils
+import ivf.ivf_baselines as ivf_baselines  
+import utils_.plot_util as plot_util  
+
+# --- Argument Parsing (Moved to top to configure globals) ---
+parser = argparse.ArgumentParser(description='Pole Loc Non-Learning')
+parser.add_argument('--quant', nargs='?', const=6, type=int, help='Enable quant mode with specified bits (default: 6)')
+parser.add_argument('--nlist', type=int, default=None, help='FAISS IVF nlist')
+parser.add_argument('--nprobe', type=int, default=None, help='FAISS IVF nprobe')
+parser.add_argument('--n_mapdetections', type=int, default=6, help='number of mapdetections') # Default 6 for non-learning
+parser.add_argument('--mapinterval', type=float, default=0.25, help='mapinterval')
+parser.add_argument('--n_locdetections', type=int, default=2, help='n_locdetections')       # Default 2 for non-learning
+parser.add_argument('--desc_dim', type=int, default=64, help='descriptor dimension (default: 64)')
+parser.add_argument('--pf', type=int, default=1000, help='the number of particle (default: 1000)') # Important!
+parser.add_argument('--eval_out', type=str, default=None, help='path to save evaluation summary (default: stdout)')
+parser.add_argument('--mode', type=str, default='full',
+                    choices=['full', 'build_map', 'localize'],
+                    help='full: build map + localize + evaluate; ...')
+parser.add_argument('--session_start', type=int, default=0, help='start index')
+parser.add_argument('--session_end', type=int, default=len(pynclt.sessions), help='end index')
+parser.add_argument('--ivf_method', type=str, default='zeroaware',
+                    choices=['kmeans', 'zeroaware', 'baseline_l2', 'baseline_hamming'],
+                    help='Choose IVF backend')
+args = parser.parse_args()    
 
 # --- Configuration ---
 mapextent = np.array([30.0, 30.0, 5.0])
 mapsize = np.full(3, 0.2)
 mapshape = np.array(mapextent / mapsize, dtype=int)
-mapinterval = 0.25
-mapdistance = 0.25
+mapinterval = args.mapinterval
+mapdistance = mapinterval
 remapdistance = 10.0
-n_mapdetections = 6
-n_locdetections = 2
-n_localmaps = 6
-desc_dim = 64
+n_mapdetections = args.n_mapdetections
+n_locdetections = args.n_locdetections
+n_localmaps = n_mapdetections
+desc_dim = args.desc_dim
+IVF_METHOD = args.ivf_method 
+pf = args.pf                
 
 T_mc_r = pynclt.T_w_o
 T_r_mc = util.invert_ht(T_mc_r)
@@ -41,7 +66,7 @@ T_m_r = T_m_mc.dot(T_mc_r)
 T_r_m = util.invert_ht(T_m_r)
 
 def get_globalmapname():
-    return 'globalmap_{:.0f}_{:.2f}_{:.2f}'.format(
+    return 'globalmap_{:.0f}_{:.2f}_{:.2f}_learning'.format(
         n_mapdetections, mapinterval, 0.08)
 
 def get_locfileprefix():
@@ -360,6 +385,21 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     descmap = mapdata['descmeans']
     descxy = mapdata['polemeans'][:, :2]
     
+    # 增加 Geometry Quantization 參數 (為了介面一致性)
+    min_x = float(descxy[:, 0].min())
+    max_x = float(descxy[:, 0].max())
+    min_y = float(descxy[:, 1].min())
+    max_y = float(descxy[:, 1].max())
+    GRID_SIZE_METERS = 10.0
+    R = max(max_x - min_x, max_y - min_y)
+    dynamic_max = int(np.ceil(R / GRID_SIZE_METERS))
+    if dynamic_max > 255: dynamic_max = 255
+    geo_qparams = (min_x, min_y, R)
+
+    descxy_u8 = None
+    if quant:
+        descxy_u8 = feature_utils.quantize_xy_array_to_u6_shared(descxy, min_x, min_y, R)
+
     qmap, thresholds = [], []
     if quant:
         qmap, thresholds = feature_utils.quantize_descmap(descmap, bits=quant_bits)
@@ -368,7 +408,6 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     if quant: print([f"{t:.10f}" for t in thresholds])
     
     polevar = 1.50
-    
     session = pynclt.session(sessionname)
     locdata = np.load(os.path.join(session.dir, get_localmapfile()), allow_pickle=True)['maps']
     polepos_m = []
@@ -386,10 +425,22 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     T_w_r_start = util.project_xy(
         session.get_T_w_r_gt(session.t_relodo[istart]).dot(T_r_mc)).dot(T_mc_r)
     
-    # IVF Construction
+    # --- [Modification 1] IVF Construction Logic ---
     desc_source = qmap if quant else descmap
     map_ids = np.arange(desc_source.shape[0], dtype=np.int64)
-    ivf = ZeroAwareIVF()
+    
+    if IVF_METHOD == 'kmeans':
+        ivf = KMeansIVF()
+    elif IVF_METHOD == 'baseline_l2':
+        print("[IVF] Using Baseline: Standard L2")
+        ivf = ivf_baselines.BaselineStandardL2()
+    elif IVF_METHOD == 'baseline_hamming':
+        print("[IVF] Using Baseline: Binary Hamming")
+        ivf = ivf_baselines.BaselineBinaryHamming()
+    else:
+        print("[IVF] Using ZeroAware")
+        ivf = ZeroAwareIVF()
+
     if ivf_nlist is not None:
         if ivf_nlist < 1: raise ValueError("--nlist must be >= 1")
         ivf.nlist = ivf_nlist
@@ -400,9 +451,12 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     print("[IVF] build stats:", build_stats)
     descmap_index, edges = ivf, None
     
-    # Filters
-    filter = particlefilter.particlefilter(10000, 
-        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, T_w_o=T_mc_r)
+    # --- [Modification 2] Particle Filter Count from Args ---
+    print("[pf]:", pf)
+    # 記得加上 geo_qparams 和 descxy_u8 以支援新的 filter 介面
+    filter = particlefilter.particlefilter(pf, 
+        T_w_r_start, 2.5, np.radians(5.0), polemap, polevar, qmap if quant else descmap, descxy, descmap_index, edges, quant, 
+        descxy_u8=descxy_u8, geo_qparams=geo_qparams, T_w_o=T_mc_r)
     filter.estimatetype = 'best'
     filter.minneff = 0.5
 
@@ -418,7 +472,8 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
     T_w_r_est = np.full([session.t_relodo.size, 4, 4], np.nan)
     T_w_r_est_knn = np.full([session.t_relodo.size, 4, 4], np.nan)
     T = session.t_relodo.size
-    n_active_per_step         = np.zeros(T, dtype=np.int32)
+    n_active_per_step = np.zeros(T, dtype=np.int32)
+    measurement_update_times = [] # 新增時間紀錄 List
 
     with progressbar.ProgressBar(max_value=session.t_relodo.size) as bar:
         for i in range(istart, session.t_relodo.size):            
@@ -427,10 +482,9 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
             relodocov[:, 2] = session.relodocov[i, [0, 1, 5], 5]
             relodocov[2, :] = session.relodocov[i, 5, [0, 1, 5]]
             
-            # Motion Update
             filter.update_motion(session.relodo[i], relodocov * 2.0**2)            
             T_w_r_est[i] = filter.estimate_pose()
-            # Measurement Update
+
             t_now = session.t_relodo[i]
             if imap < locdata.shape[0]:
                 t_end = session.t_velo[locdata[imap]['iend']]
@@ -449,7 +503,7 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                     meas_events.append({'t_now': float(t_now), 'n_active': int(len(iactive))})
                     append_count += 1
                     
-                    if len(iactive) >= 4:
+                    if len(iactive) >= 1:
                         n_active_per_step[i] = len(iactive)
                         t_mid = session.t_velo[locdata[imap]['imid']]
                         T_w_r_mid = util.project_xy(session.get_T_w_r_odo(t_mid).dot(T_r_mc)).dot(T_mc_r)
@@ -461,7 +515,14 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
                         if quant:
                             desc = feature_utils.quantize_descriptor(desc, thresholds)
                         
-                        filter.update_measurement(desc, polepos_r_now[:2].T)                   
+                        # --- [Modification 3] Time Profiling ---
+                        t_start = time.perf_counter()
+                        filter.update_measurement(desc, polepos_r_now[:2].T)
+                        t_end = time.perf_counter()
+                        
+                        t_elapsed = t_end - t_start
+                        measurement_update_times.append(t_elapsed)
+
                         T_w_r_est[i] = filter.estimate_pose()
             
                     imap += 1
@@ -470,9 +531,27 @@ def localize(sessionname, visualize=False, quant=False, quant_bits=None, ivf_nli
             
     filename = os.path.join(session.dir, get_locfileprefix() \
         + datetime.datetime.now().strftime('_%Y-%m-%d_%H-%M-%S.npz'))
-    np.savez(filename, T_w_r_est=T_w_r_est, T_w_r_est_knn=T_w_r_est_knn, meas_events=np.array(meas_events, dtype=object))
+    
+    # --- [Modification 4] Save Stats ---
+    ts_arr = np.array(measurement_update_times)
+    if ts_arr.size > 0:
+        t_mean = np.mean(ts_arr)
+        t_max = np.max(ts_arr)
+    else:
+        t_mean = 0.0
+        t_max = 0.0   
 
-def evaluate(output_path=None):
+    np.savez(filename, 
+             T_w_r_est=T_w_r_est, 
+             T_w_r_est_knn=T_w_r_est_knn, 
+             meas_events=np.array(meas_events, dtype=object),
+             meas_time_mean=t_mean,  
+             meas_time_max=t_max     
+             )
+    print('append_count', append_count)
+    
+    
+def evaluate(output_path=args.eval_out): 
     stats = []
     target_sessions = pynclt.sessions[args.session_start:args.session_end]
     for sessionname in target_sessions:
@@ -480,17 +559,27 @@ def evaluate(output_path=None):
         files.sort()
         session = pynclt.session(sessionname)
 
-        # GT Inteprolation
+        # GT Interpolation
         cumdist = np.hstack([0.0, np.cumsum(np.linalg.norm(np.diff(session.T_w_r_gt[:, :3, 3], axis=0), axis=1))])
         t_eval = scipy.interpolate.interp1d(cumdist, session.t_gt)(np.arange(0.0, cumdist[-1], 1.0))
         T_w_r_gt = np.stack([util.project_xy(session.get_T_w_r_gt(t).dot(T_r_mc)).dot(T_mc_r) for t in t_eval])
 
         T_gt_est = []
+        # --- [Mod] Stats Containers ---
+        session_time_means = []
+        session_time_maxs = []
+
         for file in files:
             fpath = os.path.join(pynclt.resultdir, sessionname, file)
             data = np.load(fpath)
             T_w_r_est = data['T_w_r_est']
             
+            # --- [Mod] Read Time Stats ---
+            t_mean = float(data.get('meas_time_mean', 0.0))
+            t_max = float(data.get('meas_time_max', 0.0))
+            session_time_means.append(t_mean)
+            session_time_maxs.append(t_max)
+
             # Interpolation Logic
             T_w_r_est_interp = np.empty([len(t_eval), 4, 4])
             iodo = 1; inum = 0
@@ -510,13 +599,7 @@ def evaluate(output_path=None):
         t_plot = t_eval[:L]  
 
         poserrors = np.linalg.norm(T_gt_est[..., :2, 3], axis=-1)
-        poserror_mean = np.mean(poserrors, axis=0)
-
-        # report_utils.plot_evaluation_result(sessionname=sessionname, 
-        #                        poserror_mean=poserror_mean, 
-        #                        t_plot=t_plot, 
-        #                        files=files,
-        #                        result_dir=pynclt.resultdir)
+        # poserror_mean = np.mean(poserrors, axis=0) # unused
 
         # Stats Calculation
         lonerror = np.mean(np.mean(np.abs(T_gt_est[..., 0, 3]), axis=-1))
@@ -526,10 +609,16 @@ def evaluate(output_path=None):
         angerrors = np.degrees(np.abs(np.array([util.ht2xyp(T)[:, 2] for T in T_gt_est])))
         angerror = np.mean(np.mean(angerrors, axis=-1))
         angrmse = np.mean(np.sqrt(np.mean(angerrors**2, axis=-1)))
+        
+        avg_time_mean = np.mean(session_time_means) if session_time_means else 0.0
+        avg_time_max = np.max(session_time_maxs) if session_time_maxs else 0.0
 
-        stats.append({'session': sessionname, 'lonerror': lonerror,
+        stats.append({
+            'session': sessionname, 'lonerror': lonerror,
             'laterror': laterror, 'poserror': poserror, 'posrmse': posrmse,
-            'angerror': angerror, 'angrmse': angrmse, 'T_gt_est': T_gt_est})
+            'angerror': angerror, 'angrmse': angrmse, 'T_gt_est': T_gt_est,
+            'time_mean': avg_time_mean, 'time_max': avg_time_max 
+        })
 
     np.savez(os.path.join(pynclt.resultdir, get_evalfile()), stats=stats)
     
@@ -540,8 +629,15 @@ def evaluate(output_path=None):
     else:
         out = open(output_path, 'a')
         close_out = True
-    print('session \t f\te_pos \trmse_pos \te_ang \te_rmse', file=out)
-    row = '{session} \t{f} \t{poserror} \t{posrmse} \t{angerror} \t{angrmse}'
+        
+    # --- [Mod] New Header Format ---
+    header = "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12}".format(
+        "session", "f(%)", "e_pos", "rmse_pos", "e_ang", "e_rmse", "t_mean(ms)", "t_max(ms)"
+    )
+    print(header, file=out)
+    
+    row = "{session:<12} {f:>10.2f} {poserror:>10.4f} {posrmse:>10.4f} {angerror:>10.4f} {angrmse:>10.4f} {t_mean:>12.4f} {t_max:>12.4f}"
+
     for i, stat in enumerate(stats):
         print(row.format(
             session=stat['session'],
@@ -549,52 +645,40 @@ def evaluate(output_path=None):
             poserror=stat['poserror'],
             posrmse=stat['posrmse'],
             angerror=stat['angerror'],
-            angrmse=stat['angrmse']),
+            angrmse=stat['angrmse'],
+            t_mean=stat['time_mean'] * 1000.0, 
+            t_max=stat['time_max'] * 1000.0    
+            ),
             file=out)
         
     if close_out:
         out.close()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--quant', nargs='?', const=6, type=int, help='Enable quant mode with specified bits (default: 6)')
-    parser.add_argument('--nlist', type=int, default=None, help='FAISS IVF nlist')
-    parser.add_argument('--nprobe', type=int, default=None, help='FAISS IVF nprobe')
-    parser.add_argument('--desc_dim', type=int, default=64, help='descriptor dimension (default: 64)')
-    parser.add_argument('--eval_out', type=str, default=None, help='path to save evaluation summary (default: stdout)')
-    parser.add_argument('--mode', type=str, default='full',
-                        choices=['full', 'build_map', 'localize'],
-                        help='full: build map + localize + evaluate; '
-                            'build_map: only build global map; '
-                            'localize: only localize & evaluate with existing map')
-    parser.add_argument('--session_start', type=int, default=0,
-                        help='start index in pynclt.sessions (inclusive)')
-    parser.add_argument('--session_end', type=int, default=len(pynclt.sessions),
-                        help='end index in pynclt.sessions (exclusive)')
-    args = parser.parse_args()
-    
     do_quant = args.quant is not None
     quant_bits = args.quant
-    desc_dim = args.desc_dim
-        
+    
     print(f"Quantization enabled? {do_quant}, bits={quant_bits}")
     ivf_nlist = args.nlist
     ivf_nprobe = args.nprobe
     
     target_sessions = pynclt.sessions[args.session_start:args.session_end]
+    
     if args.mode == 'full':
         print(f"[MODE full] Build global map + save localmaps + localize, "
               f"sessions[{args.session_start}:{args.session_end}]")
-        save_global_map_position()
+        # save_global_map_position()
         for session in target_sessions:
-            #save_local_maps(session)
+            # save_local_maps(session)
             localize(session, visualize=False, quant=do_quant, quant_bits=quant_bits, ivf_nlist=ivf_nlist, ivf_nprobe=ivf_nprobe)
         evaluate(output_path=args.eval_out)
+        
     elif args.mode == 'build_map':
         print(f"[MODE build_map] Only build global map using "
               f"sessions[{args.session_start}:{args.session_end}]")
         # save_global_map_position()
         save_global_map()
+        
     elif args.mode == 'localize':
         print(f"[MODE localize] Only localize & evaluate on "
               f"sessions[{args.session_start}:{args.session_end}] "
